@@ -17,16 +17,24 @@ class JobModel(Base):
 
     # Metrics
     chunks_created = Column(Integer, default=0)
+    tables_extracted = Column(Integer, default=0)  # <--- ADDED
+    pages_processed = Column(Integer, default=0)  # <--- ADDED
     embeddings_generated = Column(Integer, default=0)
     processing_time_seconds = Column(Float, nullable=True)
 
     # Error tracking
     error_message = Column(Text, nullable=True)
+    error_type = Column(String, nullable=True)  # <--- ADDED
+
+    # File Paths
+    intermediate_file = Column(String, nullable=True)  # <--- ADDED
 
     # JSON Metadata
     metadata_ = Column("metadata", JSON, default={})
 
+    # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)  # <--- ADDED (Fixes CompileError)
     completed_at = Column(DateTime, nullable=True)
 
 

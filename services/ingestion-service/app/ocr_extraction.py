@@ -20,7 +20,7 @@ class LightOnOCRService:
     def __init__(
             self,
             # This should be your RunPod Proxy URL
-            endpoint_url: str = "https://mqrph4kl9d2186-8000.proxy.runpod.net/v1/chat/completions",
+            endpoint_url: str = "https://zuquhaomdlqs0z-8000.proxy.runpod.net/v1/chat/completions",
             dpi: int = 200
     ):
         self.endpoint_url = endpoint_url

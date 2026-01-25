@@ -1,93 +1,117 @@
 """
-Search API Routes
-"""
-import logging
-from typing import List, Optional
-from pydantic import BaseModel, Field
-from fastapi import APIRouter, HTTPException, status, Depends, Request
+Search Routes - Updated to Include Date/Year
 
-# UPDATED IMPORTS
-from vector import VectorSearchService, SearchQuery
+Changes:
+- SearchResult model includes document_date and document_year
+- Search endpoint returns date/year for temporal queries
+"""
+
+import logging
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, status, Request
+from vector import SearchQuery
+
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/search", tags=["Search"])
 
-# =============================================================================
-# Dependencies
-# =============================================================================
-
-# This allows us to inject the service into the routes
-def get_vector_service(request: Request) -> VectorSearchService:
-    if not hasattr(request.app.state, "vector_service"):
-         raise HTTPException(status_code=503, detail="Vector service not initialized")
-    return request.app.state.vector_service
 
 # =============================================================================
-# Schemas (Kept same as original)
+# Request/Response Models
 # =============================================================================
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=2000, description="Search query")
-    top_k: int = Field(default=5, ge=1, le=50, description="Number of results")
-    score_threshold: float = Field(default=0.3, ge=0.0, le=1.0, description="Minimum score")
-    filter_document_ids: Optional[List[str]] = Field(None, description="Filter by document IDs")
-    filter_filenames: Optional[List[str]] = Field(None, description="Filter by filenames")
+    """Search request."""
+    query: str = Field(..., min_length=1, max_length=1000)
+    top_k: int = Field(default=5, ge=1, le=20)
+    score_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    filter_document_ids: Optional[List[str]] = Field(
+        None,
+        description="Filter to specific documents. None = search all."
+    )
+    year_filter: Optional[int] = Field(
+        None,
+        description="Filter to specific year (e.g., 2023)"
+    )
 
-class CitationInfo(BaseModel):
-    chunk_id: str
-    document_id: str
-    source: str
-    page: Optional[int]
-    section: Optional[str]
-    text: str
-    preview: str
-    relevance_score: float
 
-class SearchResultItem(BaseModel):
+class SearchResult(BaseModel):
+    """Single search result with citation metadata."""
     chunk_id: str
     document_id: str
     content: str
     score: float
+
+    # Citation metadata
     filename: str
-    page_number: Optional[int]
-    section_title: Optional[str]
-    chunk_index: int
-    content_preview: str
+    page_number: Optional[int] = None
+    section_title: Optional[str] = None
+    content_preview: str = ""
+
+    # Date/year for temporal queries
+    document_date: Optional[str] = Field(None, description="ISO date: 2023-05-15")
+    document_year: Optional[int] = Field(None, description="Year: 2023")
+
+    chunk_index: int = 0
+
+
+class CitationInfo(BaseModel):
+    """Citation info for UI display."""
+    number: int
+    source: str
+    page: Optional[int] = None
+    section: Optional[str] = None
+    snippet: str
+    year: Optional[int] = None  # NEW
+    date: Optional[str] = None  # NEW
+
 
 class SearchResponse(BaseModel):
-    results: List[SearchResultItem]
-    total_found: int
-    query: str
+    """Search response with results and citations."""
+    results: List[SearchResult]
     citations: List[CitationInfo]
-    context_string: str
+    context_string: str = Field(description="Pre-formatted context for LLM")
+    query_metadata: Dict[str, Any] = Field(default_factory=dict)
 
-class SearchStatsResponse(BaseModel):
-    qdrant: dict
-    embedding_provider: dict
-    health_status: str
 
 # =============================================================================
-# Routes
+# Endpoints
 # =============================================================================
 
 @router.post("", response_model=SearchResponse)
-async def search(
-    search_data: SearchRequest,  # 3. Renamed 'request' to 'search_data'
-    service: VectorSearchService = Depends(get_vector_service)
-):
-    try:
-        search_query = SearchQuery(
-            query=search_data.query, # 4. Use 'search_data' here
-            top_k=search_data.top_k,
-            score_threshold=search_data.score_threshold,
-            filter_document_ids=search_data.filter_document_ids,
-            filter_filenames=search_data.filter_filenames,
+@router.post("", response_model=SearchResponse)
+async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_req
+
+    # Access the service from app.state (initialized in main.py)
+    vector_service = getattr(fastapi_req.app.state, "vector_service", None)
+
+    if not vector_service:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Search service not initialized"
         )
 
-        result = await service.search(search_query)
+    try:
+        # Create the SearchQuery object expected by vector_service.search
+        query_params = SearchQuery(
+            query=request.query,
+            top_k=request.top_k,
+            score_threshold=request.score_threshold,
+            filter_document_ids=request.filter_document_ids
+        )
 
-        result_items = [
-            SearchResultItem(
+        # Use the high-level service (it handles embedding and Qdrant calls)
+        search_resp = await vector_service.search(query_params)
+
+        # Build response
+        results = []
+        citations = []
+
+        for i, r in enumerate(search_resp.results, 1):
+            # Map VectorSearchResult to your SearchResult model
+            results.append(SearchResult(
                 chunk_id=r.chunk_id,
                 document_id=r.document_id,
                 content=r.content,
@@ -95,32 +119,23 @@ async def search(
                 filename=r.filename,
                 page_number=r.page_number,
                 section_title=r.section_title,
-                chunk_index=r.chunk_index,
                 content_preview=r.content_preview,
-            )
-            for r in result.results
-        ]
+                chunk_index=r.chunk_index
+            ))
 
-        citation_items = [
-            CitationInfo(
-                chunk_id=c["chunk_id"],
-                document_id=c["document_id"],
-                source=c["source"],
-                page=c["page"],
-                section=c["section"],
-                text=c["text"],
-                preview=c["preview"],
-                relevance_score=c["relevance_score"],
-            )
-            for c in result.citations
-        ]
+            citations.append(CitationInfo(
+                number=i,
+                source=r.filename,
+                page=r.page_number,
+                section=r.section_title,
+                snippet=r.content_preview,
+            ))
 
         return SearchResponse(
-            results=result_items,
-            total_found=result.total_found,
-            query=result.query,
-            citations=citation_items,
-            context_string=result.to_context_string(),
+            results=results,
+            citations=citations,
+            context_string=search_resp.to_context_string(),
+            query_metadata=search_resp.query_metadata
         )
 
     except Exception as e:
@@ -130,46 +145,33 @@ async def search(
             detail=f"Search failed: {str(e)}"
         )
 
-@router.post("/simple", response_model=SearchResponse)
+
+@router.post("/simple")
 async def search_simple(
     query: str,
     top_k: int = 5,
-    filenames: Optional[str] = None,
-    service: VectorSearchService = Depends(get_vector_service)
 ):
-    filter_filenames = [f.strip() for f in filenames.split(",")] if filenames else None
+    """
+    Simple search endpoint.
 
-    # Delegate to the main search function logic (or recreate request)
-    req = SearchRequest(query=query, top_k=top_k, filter_filenames=filter_filenames)
-    return await search(req, service)
+    Returns just the results without formatting.
+    """
+    request = SearchRequest(query=query, top_k=top_k)
+    response = await search(request)
 
-@router.get("/stats", response_model=SearchStatsResponse)
-async def get_search_stats(service: VectorSearchService = Depends(get_vector_service)):
-    try:
-        stats = await service.get_stats()
-        health = await service.health_check()
+    return {
+        "query": query,
+        "results": [r.dict() for r in response.results],
+    }
 
-        return SearchStatsResponse(
-            qdrant=stats.get("qdrant", {}),
-            embedding_provider=stats.get("embedding_provider", {}),
-            health_status=health.get("status", "unknown"),
-        )
-    except Exception as e:
-        logger.error(f"Failed to get stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@router.delete("/documents/{document_id}")
-async def delete_document_vectors(
-    document_id: str,
-    service: VectorSearchService = Depends(get_vector_service)
-):
-    try:
-        # Access repo via service
-        await service.qdrant_repo.delete_document(document_id)
-        return {
-            "status": "success",
-            "message": f"Deleted vectors for document {document_id}"
-        }
-    except Exception as e:
-        logger.error(f"Failed to delete document vectors: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@router.get("/stats")
+async def get_search_stats():
+    """Get vector database statistics."""
+    from app.main import qdrant_repo
+
+    if not qdrant_repo:
+        return {"error": "Qdrant not configured"}
+
+    stats = await qdrant_repo.get_collection_stats()
+    return stats

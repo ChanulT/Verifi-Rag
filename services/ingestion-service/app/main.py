@@ -26,7 +26,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Local imports
 from app.configs import settings_manager, load_settings_from_env
-from app.services.extraction import ExtractionService
 from app.services.chunking import ChunkingService
 from app.services.embedding import EmbeddingService
 from app.providers.embedding import get_embedding_provider
@@ -191,7 +190,7 @@ async def lifespan(app: FastAPI):
 
             endpoint_url = os.getenv(
                 "OCR_ENDPOINT_URL",
-                "https://mqrph4kl9d2186-8000.proxy.runpod.net//v1/chat/completions",
+                "https://zuquhaomdlqs0z-8000.proxy.runpod.net//v1/chat/completions",
             )
 
             extraction_service = LightOnOCRService(

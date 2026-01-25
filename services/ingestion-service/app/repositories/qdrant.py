@@ -1,34 +1,32 @@
 """
-Qdrant Vector Database Repository
+Qdrant Repository - Updated with Date/Year Metadata
 
-Handles all Qdrant operations:
-- Collection management
-- Document/chunk upsert with rich metadata
-- Vector search with filtering
-
-Rich metadata strategy enables chatbot UI to display:
-- Source document name
-- Page numbers
-- Text snippets for citations
+Changes:
+- Added document_date and document_year to vector payload
+- Search results now include date/year for temporal queries
+- Added index on document_year for filtering
 """
 
 import logging
 import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from qdrant_client import QdrantClient, AsyncQdrantClient
-from qdrant_client.http import models as qdrant_models
-from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    PayloadSchemaType,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "QdrantRepository",
-    "VectorSearchResult",
-    "QdrantConfig",
-]
+__all__ = ["QdrantRepository", "QdrantConfig", "VectorSearchResult"]
 
 
 @dataclass
@@ -37,25 +35,18 @@ class QdrantConfig:
     url: str = "http://localhost:6333"
     api_key: Optional[str] = None
     collection_name: str = "medical_documents"
-    vector_size: int = 1536  # BGE-small default
+    vector_size: int = 384
     distance: str = "Cosine"
-    # Connection settings
     timeout: float = 30.0
     prefer_grpc: bool = False
-    # Schema management
-    recreate_if_dimension_mismatch: bool = False
 
 
 @dataclass
 class VectorSearchResult:
     """
-    Search result with full metadata for citation display.
+    Search result with metadata for citations.
 
-    Contains all information needed by chatbot UI:
-    - chunk_id: Unique identifier for deduplication
-    - content: The actual text to display/use
-    - score: Relevance score (0-1 for cosine)
-    - metadata: Rich context for citations
+    Includes date/year for temporal queries.
     """
     chunk_id: str
     document_id: str
@@ -64,504 +55,386 @@ class VectorSearchResult:
 
     # Citation metadata
     filename: str
-    page_number: Optional[int]
-    section_title: Optional[str]
-    chunk_index: int
-    content_preview: str
+    page_number: Optional[int] = None
+    section_title: Optional[str] = None
+    content_preview: str = ""
 
-    # Additional context
-    total_pages: Optional[int]
-    source_file: Optional[str]
-    created_at: Optional[str]
+    # NEW: Date/year for temporal queries
+    document_date: Optional[str] = None  # ISO format: "2023-05-15"
+    document_year: Optional[int] = None  # e.g., 2023
 
-    def to_citation_dict(self) -> Dict[str, Any]:
-        """
-        Format for chatbot citation display.
+    # Additional metadata
+    chunk_index: int = 0
+    total_pages: Optional[int] = None
+    has_table: bool = False
+    created_at: Optional[str] = None
 
-        Returns dict suitable for UI rendering like:
-        "Source: report.pdf, Page 3, Section: Lab Results"
-        """
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for API response."""
         return {
             "chunk_id": self.chunk_id,
             "document_id": self.document_id,
-            "source": self.filename,
-            "page": self.page_number,
-            "section": self.section_title,
-            "text": self.content,
-            "preview": self.content_preview,
-            "relevance_score": round(self.score, 4),
+            "content": self.content,
+            "score": self.score,
+            "filename": self.filename,
+            "page_number": self.page_number,
+            "section_title": self.section_title,
+            "content_preview": self.content_preview,
+            "document_date": self.document_date,
+            "document_year": self.document_year,
+            "chunk_index": self.chunk_index,
         }
 
 
 class QdrantRepository:
     """
-    Repository for Qdrant vector database operations.
+    Qdrant vector database repository.
 
     Handles:
-    - Collection creation with optimal settings
-    - Document ingestion with rich metadata
-    - Similarity search with filtering
-    - Batch operations for efficiency
-
-    Metadata Schema (stored with each vector):
-    {
-        "document_id": "uuid",
-        "chunk_id": "uuid",
-        "chunk_index": 0,
-        "filename": "report.pdf",
-        "source_file": "/path/to/report.pdf",
-        "page_number": 3,
-        "section_title": "Lab Results",
-        "content": "Full chunk text...",
-        "content_preview": "First 200 chars...",
-        "total_pages": 10,
-        "created_at": "2024-01-15T10:30:00Z",
-        "content_length": 850,
-        "has_table": false
-    }
-
-    Example:
-        repo = QdrantRepository(config)
-        await repo.initialize()
-
-        # Ingest chunks
-        await repo.upsert_chunks(document_id, chunks, filename, metadata)
-
-        # Search
-        results = await repo.search(query_embedding, top_k=5)
+    - Vector storage with rich metadata
+    - Semantic search
+    - Document filtering
+    - Year-based filtering for temporal queries
     """
 
     def __init__(self, config: QdrantConfig):
-        """
-        Initialize Qdrant repository.
-
-        Args:
-            config: Qdrant connection configuration
-        """
         self.config = config
-        self._client: Optional[AsyncQdrantClient] = None
-        self._sync_client: Optional[QdrantClient] = None
-        self._initialized = False
+        self.client: Optional[AsyncQdrantClient] = None
 
-        logger.info(f"QdrantRepository created: {config.url}")
+        # Map distance string to Qdrant Distance enum
+        self._distance_map = {
+            "cosine": Distance.COSINE,
+            "euclidean": Distance.EUCLID,
+            "dot": Distance.DOT,
+        }
 
     async def initialize(self) -> None:
-        """
-        Initialize Qdrant connection and ensure collection exists.
-
-        Creates collection with optimal settings for RAG:
-        - Cosine distance (normalized embeddings)
-        - Payload indexing on document_id and filename
-        """
-        if self._initialized:
-            return
-
+        """Initialize Qdrant client and ensure collection exists."""
         try:
-            # Create async client
-            self._client = AsyncQdrantClient(
+            self.client = AsyncQdrantClient(
                 url=self.config.url,
                 api_key=self.config.api_key,
                 timeout=self.config.timeout,
                 prefer_grpc=self.config.prefer_grpc,
             )
 
-            # Also create sync client for operations that need it
-            self._sync_client = QdrantClient(
-                url=self.config.url,
-                api_key=self.config.api_key,
-                timeout=self.config.timeout,
-                prefer_grpc=self.config.prefer_grpc,
-            )
+            # Check if collection exists
+            collections = await self.client.get_collections()
+            collection_names = [c.name for c in collections.collections]
 
-            # Check connection
-            await self._client.get_collections()
-            logger.info(f"✓ Connected to Qdrant: {self.config.url}")
+            if self.config.collection_name not in collection_names:
+                await self._create_collection()
+            else:
+                logger.info(f"Collection '{self.config.collection_name}' already exists")
 
-            # Ensure collection exists
-            await self._ensure_collection()
+            # Ensure indexes exist
+            await self._create_indexes()
 
-            self._initialized = True
+            logger.info(f"Qdrant repository initialized: {self.config.url}")
 
         except Exception as e:
             logger.error(f"Failed to initialize Qdrant: {e}")
             raise
 
-    async def _ensure_collection(self) -> None:
-        """Create collection if it doesn't exist (and optionally recreate if dim mismatches)."""
+    async def _create_collection(self) -> None:
+        """Create the vector collection."""
+        distance = self._distance_map.get(
+            self.config.distance.lower(),
+            Distance.COSINE
+        )
+
+        await self.client.create_collection(
+            collection_name=self.config.collection_name,
+            vectors_config=VectorParams(
+                size=self.config.vector_size,
+                distance=distance,
+            ),
+        )
+
+        logger.info(
+            f"Created collection '{self.config.collection_name}' "
+            f"(size={self.config.vector_size}, distance={distance})"
+        )
+
+    async def _create_indexes(self) -> None:
+        """Create payload indexes for efficient filtering."""
         try:
-            # Check if collection exists
-            collections = await self._client.get_collections()
-            collection_names = [c.name for c in collections.collections]
-
-            if self.config.collection_name in collection_names:
-                # Validate existing collection vector size matches expected
-                info = await self._client.get_collection(self.config.collection_name)
-
-                # Qdrant returns vectors config in a couple of shapes; handle the common single-vector case.
-                existing_size = None
-                try:
-                    if getattr(info.config.params, "vectors", None) is not None:
-                        existing_size = info.config.params.vectors.size
-                except Exception:
-                    existing_size = None
-
-                if existing_size is not None and existing_size != self.config.vector_size:
-                    logger.warning(
-                        f"Collection '{self.config.collection_name}' exists with dim={existing_size} "
-                        f"but configured dim={self.config.vector_size}."
-                    )
-
-                    # Safety: only recreate if explicitly allowed
-                    if getattr(self.config, "recreate_if_dimension_mismatch", False):
-                        logger.warning(
-                            f"Recreating collection '{self.config.collection_name}' to apply new dimension..."
-                        )
-                        await self._client.delete_collection(self.config.collection_name)
-                    else:
-                        logger.warning(
-                            "Not recreating collection (recreate_if_dimension_mismatch=false). "
-                            "Upserts will fail until you recreate the collection or change EMBEDDING_DIMENSION."
-                        )
-                        return
-                else:
-                    logger.info(f"Collection '{self.config.collection_name}' already exists")
-                    return
-
-            # Create collection with optimal settings
-            distance_map = {
-                "Cosine": qdrant_models.Distance.COSINE,
-                "Euclidean": qdrant_models.Distance.EUCLID,
-                "Dot": qdrant_models.Distance.DOT,
-            }
-
-            await self._client.create_collection(
-                collection_name=self.config.collection_name,
-                vectors_config=qdrant_models.VectorParams(
-                    size=self.config.vector_size,
-                    distance=distance_map.get(self.config.distance, qdrant_models.Distance.COSINE),
-                ),
-                # Optimize for RAG workloads
-                optimizers_config=qdrant_models.OptimizersConfigDiff(
-                    indexing_threshold=10000,  # Build index after 10k vectors
-                ),
-            )
-
-            # Create payload indexes for efficient filtering
-            await self._client.create_payload_index(
+            # Index on document_id (for document-level queries)
+            await self.client.create_payload_index(
                 collection_name=self.config.collection_name,
                 field_name="document_id",
-                field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
+                field_schema=PayloadSchemaType.KEYWORD,
             )
 
-            await self._client.create_payload_index(
+            # Index on filename
+            await self.client.create_payload_index(
                 collection_name=self.config.collection_name,
                 field_name="filename",
-                field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
+                field_schema=PayloadSchemaType.KEYWORD,
             )
 
-            logger.info(
-                f"✓ Created collection '{self.config.collection_name}' "
-                f"(dim={self.config.vector_size}, dist={self.config.distance})"
+            # NEW: Index on document_year for temporal filtering
+            await self.client.create_payload_index(
+                collection_name=self.config.collection_name,
+                field_name="document_year",
+                field_schema=PayloadSchemaType.INTEGER,
             )
 
-        except UnexpectedResponse as e:
-            if "already exists" in str(e).lower():
-                logger.info(f"Collection '{self.config.collection_name}' already exists")
-            else:
-                raise
+            logger.info("Payload indexes created")
+
+        except Exception as e:
+            # Indexes might already exist
+            logger.debug(f"Index creation note: {e}")
 
     async def upsert_chunks(
-            self,
-            document_id: str,
-            chunks: List[Any],  # List of Chunk dataclass
-            filename: str,
-            source_file: str,
-            total_pages: int,
-            extra_metadata: Optional[Dict[str, Any]] = None,
+        self,
+        document_id: str,
+        chunks: List,
+        filename: str,
+        document_date: Optional[str] = None,
+        document_year: Optional[int] = None,
+        batch_size: int = 100,
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
-        Upsert document chunks with rich metadata.
-
-        Each chunk is stored with comprehensive metadata enabling:
-        - Citation display in chatbot UI
-        - Filtering by document/filename
-        - Page number references
+        Upsert chunks with embeddings to Qdrant.
 
         Args:
             document_id: Unique document identifier
-            chunks: List of Chunk objects (must have .embedding)
-            filename: Original filename for display
-            source_file: Full path to source
-            total_pages: Total pages in document
-            extra_metadata: Additional metadata to include
+            chunks: List of chunk objects with content and embedding
+            filename: Source filename
+            document_date: ISO date string (e.g., "2023-05-15")
+            document_year: Year as integer (e.g., 2023)
+            batch_size: Batch size for upsert
 
         Returns:
-            Number of chunks successfully upserted
+            Number of vectors upserted
         """
-        if not self._initialized:
-            await self.initialize()
+        if not self.client:
+            raise RuntimeError("Qdrant client not initialized")
 
-        if not chunks:
-            logger.warning("No chunks to upsert")
-            return 0
-
-        # Filter chunks with embeddings
-        chunks_with_embeddings = [c for c in chunks if c.embedding is not None]
-
-        if not chunks_with_embeddings:
-            logger.warning("No chunks have embeddings")
-            return 0
-
-        logger.info(
-            f"Upserting {len(chunks_with_embeddings)} chunks "
-            f"for document '{filename}' ({document_id})"
-        )
-
-        # Prepare points for upsert
         points = []
-        timestamp = datetime.utcnow().isoformat()
 
-        for chunk in chunks_with_embeddings:
-            # Generate unique chunk ID
-            chunk_id = f"{document_id}-{chunk.index}"
+        for chunk in chunks:
+            if not chunk.embedding:
+                logger.warning(f"Chunk {chunk.index} has no embedding, skipping")
+                continue
 
-            # Extract page number from metadata if available
-            page_number = None
-            section_title = None
-            has_table = False
+            # Generate deterministic UUID for idempotent upserts
+            chunk_id = str(uuid.uuid5(
+                uuid.NAMESPACE_DNS,
+                f"{document_id}-{chunk.index}"
+            ))
 
-            if chunk.metadata:
-                page_number = chunk.metadata.get("page_number")
-                section_title = chunk.metadata.get("section_title")
-                has_table = chunk.metadata.get("has_table", False)
-
-            # If page_number still None, try chunk's direct attribute
-            if page_number is None and hasattr(chunk, 'page_number'):
-                page_number = chunk.page_number
-
-            if section_title is None and hasattr(chunk, 'section_title'):
-                section_title = chunk.section_title
-
-            # Build rich metadata payload
+            # Build rich payload with date/year
             payload = {
                 # Identifiers
                 "document_id": document_id,
                 "chunk_id": chunk_id,
                 "chunk_index": chunk.index,
 
-                # Source info (for citations)
+                # Source info for citations
                 "filename": filename,
-                "source_file": source_file,
-                "page_number": page_number,
-                "section_title": section_title,
+                "source_file": filename,
+                "page_number": getattr(chunk, 'page_number', None),
+                "section_title": getattr(chunk, 'section_title', None),
 
                 # Content
                 "content": chunk.content,
-                "content_preview": chunk.content[:200] + "..." if len(chunk.content) > 200 else chunk.content,
-                "content_length": len(chunk.content),
+                "content_preview": chunk.content[:200] if chunk.content else "",
+                "content_length": len(chunk.content) if chunk.content else 0,
 
-                # Document context
-                "total_pages": total_pages,
-                "total_chunks": len(chunks),
+                # NEW: Date/year for temporal queries
+                "document_date": document_date,
+                "document_year": document_year,
 
                 # Metadata
-                "created_at": timestamp,
-                "has_table": has_table,
+                "total_pages": getattr(chunk, 'total_pages', None),
+                "has_table": getattr(chunk, 'has_table', False),
+                "created_at": datetime.utcnow().isoformat(),
             }
 
-            # Add extra metadata
             if extra_metadata:
-                payload["extra"] = extra_metadata
+                payload.update(extra_metadata)
 
-            # Create point
-            point = qdrant_models.PointStruct(
-                id=str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)),  # Deterministic UUID
+            # Add any additional metadata from chunk
+            if hasattr(chunk, 'metadata') and chunk.metadata:
+                for key, value in chunk.metadata.items():
+                    if key not in payload:
+                        payload[key] = value
+
+            points.append(PointStruct(
+                id=chunk_id,
                 vector=chunk.embedding,
                 payload=payload,
-            )
-            points.append(point)
+            ))
 
-        # Batch upsert
-        try:
-            await self._client.upsert(
+        if not points:
+            logger.warning("No valid points to upsert")
+            return 0
+
+        # Upsert in batches
+        total_upserted = 0
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i + batch_size]
+            await self.client.upsert(
                 collection_name=self.config.collection_name,
-                points=points,
-                wait=True,  # Wait for indexing
+                points=batch,
+                wait=True,
             )
+            total_upserted += len(batch)
+            logger.debug(f"Upserted batch: {total_upserted}/{len(points)}")
 
-            logger.info(
-                f"✓ Upserted {len(points)} chunks for '{filename}'"
-            )
-            return len(points)
+        logger.info(
+            f"Upserted {total_upserted} vectors for document {document_id} "
+            f"(year={document_year})"
+        )
 
-        except Exception as e:
-            logger.error(f"Failed to upsert chunks: {e}")
-            raise
+        return total_upserted
 
     async def search(
-            self,
-            query_embedding: List[float],
-            top_k: int = 5,
-            score_threshold: float = 0.0,
-            filter_document_ids: Optional[List[str]] = None,
-            filter_filenames: Optional[List[str]] = None,
+        self,
+        query_embedding: List[float],
+        top_k: int = 5,
+        score_threshold: float = 0.0,
+        document_ids: Optional[List[str]] = None,
+        year_filter: Optional[int] = None,
+        year_range: Optional[tuple] = None,
     ) -> List[VectorSearchResult]:
         """
-        Search for similar chunks.
+        Search for similar vectors.
 
         Args:
             query_embedding: Query vector
-            top_k: Number of results to return
-            score_threshold: Minimum similarity score (0-1 for cosine)
-            filter_document_ids: Only search these documents
-            filter_filenames: Only search these files
+            top_k: Number of results
+            score_threshold: Minimum similarity score
+            document_ids: Filter to specific documents (None = all)
+            year_filter: Filter to specific year
+            year_range: Filter to year range (min_year, max_year)
 
         Returns:
-            List of VectorSearchResult with full metadata
+            List of VectorSearchResult with date/year metadata
         """
-        if not self._initialized:
-            await self.initialize()
+        if not self.client:
+            raise RuntimeError("Qdrant client not initialized")
 
         # Build filter
         filter_conditions = []
 
-        if filter_document_ids:
+        # Document filter
+        if document_ids:
+            for doc_id in document_ids:
+                filter_conditions.append(
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=doc_id),
+                    )
+                )
+
+        # Year filter
+        if year_filter:
             filter_conditions.append(
-                qdrant_models.FieldCondition(
-                    key="document_id",
-                    match=qdrant_models.MatchAny(any=filter_document_ids),
+                FieldCondition(
+                    key="document_year",
+                    match=MatchValue(value=year_filter),
                 )
             )
 
-        if filter_filenames:
-            filter_conditions.append(
-                qdrant_models.FieldCondition(
-                    key="filename",
-                    match=qdrant_models.MatchAny(any=filter_filenames),
-                )
-            )
-
-        query_filter = None
+        # Build final filter
+        search_filter = None
         if filter_conditions:
-            query_filter = qdrant_models.Filter(
-                must=filter_conditions
-            )
+            if len(filter_conditions) == 1:
+                search_filter = Filter(must=filter_conditions)
+            else:
+                # OR for document_ids, AND for other filters
+                if document_ids and len(document_ids) > 1:
+                    search_filter = Filter(should=filter_conditions)
+                else:
+                    search_filter = Filter(must=filter_conditions)
 
         # Execute search
-        try:
-            results = await self._client.search(
-                collection_name=self.config.collection_name,
-                query_vector=query_embedding,
-                query_filter=query_filter,
-                limit=top_k,
-                score_threshold=score_threshold,
-                with_payload=True,
-            )
+        results = await self.client.search(
+            collection_name=self.config.collection_name,
+            query_vector=query_embedding,
+            limit=top_k,
+            score_threshold=score_threshold,
+            query_filter=search_filter,
+            with_payload=True,
+        )
 
-            # Convert to VectorSearchResult
-            search_results = []
+        # Convert to VectorSearchResult
+        search_results = []
+        for result in results:
+            payload = result.payload or {}
 
-            for hit in results:
-                payload = hit.payload or {}
+            search_results.append(VectorSearchResult(
+                chunk_id=payload.get("chunk_id", str(result.id)),
+                document_id=payload.get("document_id", ""),
+                content=payload.get("content", ""),
+                score=result.score,
+                filename=payload.get("filename", "unknown"),
+                page_number=payload.get("page_number"),
+                section_title=payload.get("section_title"),
+                content_preview=payload.get("content_preview", ""),
+                document_date=payload.get("document_date"),
+                document_year=payload.get("document_year"),
+                chunk_index=payload.get("chunk_index", 0),
+                total_pages=payload.get("total_pages"),
+                has_table=payload.get("has_table", False),
+                created_at=payload.get("created_at"),
+            ))
 
-                result = VectorSearchResult(
-                    chunk_id=payload.get("chunk_id", ""),
-                    document_id=payload.get("document_id", ""),
-                    content=payload.get("content", ""),
-                    score=hit.score,
-                    filename=payload.get("filename", "unknown"),
-                    page_number=payload.get("page_number"),
-                    section_title=payload.get("section_title"),
-                    chunk_index=payload.get("chunk_index", 0),
-                    content_preview=payload.get("content_preview", ""),
-                    total_pages=payload.get("total_pages"),
-                    source_file=payload.get("source_file"),
-                    created_at=payload.get("created_at"),
-                )
-                search_results.append(result)
-
-            logger.debug(f"Search returned {len(search_results)} results")
-            return search_results
-
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
-            raise
+        logger.debug(f"Search returned {len(search_results)} results")
+        return search_results
 
     async def delete_document(self, document_id: str) -> int:
-        """
-        Delete all chunks for a document.
+        """Delete all vectors for a document."""
+        if not self.client:
+            raise RuntimeError("Qdrant client not initialized")
 
-        Args:
-            document_id: Document to delete
-
-        Returns:
-            Number of points deleted
-        """
-        if not self._initialized:
-            await self.initialize()
-
-        try:
-            # Delete by filter
-            result = await self._client.delete(
-                collection_name=self.config.collection_name,
-                points_selector=qdrant_models.FilterSelector(
-                    filter=qdrant_models.Filter(
-                        must=[
-                            qdrant_models.FieldCondition(
-                                key="document_id",
-                                match=qdrant_models.MatchValue(value=document_id),
-                            )
-                        ]
+        result = await self.client.delete(
+            collection_name=self.config.collection_name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=document_id),
                     )
-                ),
-            )
+                ]
+            ),
+        )
 
-            logger.info(f"Deleted document {document_id} from vector store")
-            return 1  # Qdrant doesn't return count
-
-        except Exception as e:
-            logger.error(f"Failed to delete document: {e}")
-            raise
+        logger.info(f"Deleted vectors for document: {document_id}")
+        return 1
 
     async def get_collection_stats(self) -> Dict[str, Any]:
         """Get collection statistics."""
-        if not self._initialized:
-            await self.initialize()
+        if not self.client:
+            return {"error": "Client not initialized"}
 
         try:
-            info = await self._client.get_collection(self.config.collection_name)
-
+            info = await self.client.get_collection(self.config.collection_name)
             return {
                 "collection_name": self.config.collection_name,
                 "vectors_count": info.vectors_count,
                 "points_count": info.points_count,
-                "indexed_vectors_count": info.indexed_vectors_count,
-                "status": info.status.value,
+                "status": info.status.name,
             }
-
         except Exception as e:
-            logger.error(f"Failed to get collection stats: {e}")
             return {"error": str(e)}
 
     async def health_check(self) -> bool:
-        """Check Qdrant connection health."""
+        """Check Qdrant health."""
         try:
-            if not self._client:
+            if not self.client:
                 return False
-            await self._client.get_collections()
+            await self.client.get_collections()
             return True
         except Exception:
             return False
 
     async def close(self) -> None:
-        """Close Qdrant connections."""
-        if self._client:
-            await self._client.close()
-            self._client = None
-
-        if self._sync_client:
-            self._sync_client.close()
-            self._sync_client = None
-
-        self._initialized = False
-        logger.info("Qdrant connections closed")
+        """Close the client connection."""
+        if self.client:
+            await self.client.close()
+            logger.info("Qdrant client closed")
