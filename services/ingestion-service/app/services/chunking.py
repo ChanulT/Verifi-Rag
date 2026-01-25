@@ -11,6 +11,7 @@ Strategies:
 
 import asyncio
 import logging
+import re
 from typing import List, Optional, Dict, Any
 
 from langchain_core.documents import Document
@@ -135,22 +136,51 @@ class ChunkingService:
         Returns:
             List of Chunk objects
         """
-        if not content.strip():
-            return []
+        if "=== Page" in content:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.chunk_by_page, content, metadata)
 
-        logger.debug(f"Chunking content: {len(content)} characters")
+            # Fallback to standard recursive chunking
+        return await super().chunk(content, metadata)
 
-        # Run blocking chunking in executor
-        loop = asyncio.get_event_loop()
-        chunks = await loop.run_in_executor(
-            None,
-            self._chunk_sync,
-            content,
-            metadata
-        )
+    def chunk_by_page(self, content: str, metadata: Dict[str, Any]) -> List[Chunk]:
+        """
+        Splits content strictly by page delimiters added by the extractor.
+        """
+        # Split by the "=== Page X ===" delimiter used in ocr_extraction.py
+        # We capture the page number in the regex
+        page_splits = re.split(r'(=== Page \d+ ===\n)', content)
 
-        logger.info(f"✓ Created {len(chunks)} chunks")
+        chunks = []
+        current_chunk_index = 0
 
+        # The split result looks like: ['', '=== Page 1 ===\n', 'Content...', '=== Page 2 ===\n', 'Content...']
+        # We iterate in steps of 2 to pair the Header with the Content
+        for i in range(1, len(page_splits), 2):
+            page_header = page_splits[i]
+            page_content = page_splits[i + 1] if i + 1 < len(page_splits) else ""
+
+            full_text = page_header + page_content
+
+            # Extract page number for metadata
+            page_num_match = re.search(r'Page (\d+)', page_header)
+            page_num = int(page_num_match.group(1)) if page_num_match else None
+
+            # Create the Chunk
+            chunk = Chunk(
+                content=full_text.strip(),
+                index=current_chunk_index,
+                page_number=page_num,
+                metadata={
+                    **metadata,
+                    "chunk_strategy": "page_based",
+                    "page_number": page_num
+                }
+            )
+            chunks.append(chunk)
+            current_chunk_index += 1
+
+        logger.info(f"✓ Created {len(chunks)} page-based chunks")
         return chunks
 
     def _chunk_sync(

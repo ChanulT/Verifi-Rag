@@ -6,14 +6,17 @@ Supports:
 - Database-backed configuration (optional, for runtime changes)
 - Thread-safe settings access
 
-Mirrors the pattern used in embedding-service/config.py
+Now includes Qdrant vector database configuration.
 """
 
 import os
 import threading
+from pathlib import Path
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
-load_dotenv = True
+from dotenv import load_dotenv
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 __all__ = ["Settings", "SettingsManager", "settings_manager", "load_settings_from_env"]
 
@@ -29,10 +32,12 @@ class Settings(BaseModel):
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8002, ge=1024, le=65535)
 
-    # PDF Extraction (Docling)
+    # =========================================================================
+    # PDF Extraction Configuration
+    # =========================================================================
     extraction_service: str = Field(
         default="docling",
-        description="Extraction service: 'docling' or 'lighton_ocr'"
+        description="Extraction service: 'docling', 'lighton_ocr', or 'unstructured'"
     )
 
     # Docling configuration
@@ -57,14 +62,18 @@ class Settings(BaseModel):
         description="DPI for PDF to image conversion"
     )
 
-    # Chunking configuration
+    # =========================================================================
+    # Chunking Configuration
+    # =========================================================================
     chunk_size: int = Field(default=1000, ge=100, le=10000)
     chunk_overlap: int = Field(default=200, ge=0, le=1000)
     min_chunk_size: int = Field(default=100, ge=50)
     max_chunk_size: int = Field(default=2000, ge=500)
     use_semantic_chunking: bool = Field(default=True)
 
-    # Embedding configuration
+    # =========================================================================
+    # Embedding Configuration
+    # =========================================================================
     embedding_provider: str = Field(
         default="local",
         description="Embedding provider: 'local' (your service) or 'openai'"
@@ -79,6 +88,10 @@ class Settings(BaseModel):
         le=3600,
         description="Timeout for embedding requests (600s = 10min for CPU)"
     )
+    embedding_dimension: int = Field(
+        default=384,
+        description="Embedding vector dimension (384 for BGE-small)"
+    )
     openai_api_key: Optional[str] = Field(
         default=None,
         description="OpenAI API key (only if using openai provider)"
@@ -88,19 +101,57 @@ class Settings(BaseModel):
         description="OpenAI model name"
     )
 
-    # Storage
+    # =========================================================================
+    # Qdrant Vector Database Configuration
+    # =========================================================================
+    qdrant_url: str = Field(
+        default="http://localhost:6333",
+        description="Qdrant server URL"
+    )
+    qdrant_api_key: Optional[str] = Field(
+        default=None,
+        description="Qdrant API key (for Qdrant Cloud)"
+    )
+    qdrant_collection_name: str = Field(
+        default="medical_documents",
+        description="Qdrant collection name"
+    )
+    qdrant_distance: str = Field(
+        default="Cosine",
+        description="Distance metric: 'Cosine', 'Euclidean', or 'Dot'"
+    )
+    qdrant_timeout: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=120.0,
+        description="Qdrant operation timeout"
+    )
+    enable_qdrant: bool = Field(
+        default=True,
+        description="Enable Qdrant vector storage"
+    )
+
+    # =========================================================================
+    # Storage Configuration
+    # =========================================================================
     upload_dir: str = Field(default="./uploads")
     cache_dir: str = Field(default="./cache")
     max_file_size_mb: int = Field(default=50, ge=1, le=500)
 
-    # Processing
+    # =========================================================================
+    # Processing Configuration
+    # =========================================================================
     max_concurrent_jobs: int = Field(default=10, ge=1, le=100)
     job_timeout_seconds: int = Field(default=300, ge=30)
 
-    # API configuration
+    # =========================================================================
+    # API Configuration
+    # =========================================================================
     cors_origins: List[str] = Field(default=["*"])
 
-    # Feature flags
+    # =========================================================================
+    # Feature Flags
+    # =========================================================================
     use_db_settings: bool = Field(
         default=False,
         description="Load/save settings from database when true"
@@ -119,6 +170,14 @@ class Settings(BaseModel):
             raise ValueError("chunk_overlap must be less than chunk_size")
         return v
 
+    @field_validator("qdrant_distance")
+    def validate_qdrant_distance(cls, v):
+        """Validate Qdrant distance metric."""
+        valid = ["Cosine", "Euclidean", "Dot"]
+        if v not in valid:
+            raise ValueError(f"qdrant_distance must be one of {valid}")
+        return v
+
     class Config:
         frozen = True  # Make settings immutable after creation
 
@@ -131,7 +190,7 @@ def load_settings_from_env() -> Settings:
         port=int(os.getenv("INGESTION_PORT", "8002")),
 
         # Extraction
-        extraction_service=os.getenv("EXTRACTION_SERVICE", "docling"),
+        extraction_service=os.getenv("EXTRACTION_SERVICE", "lighton_ocr"),
 
         # PDF Extraction - Docling
         enable_ocr=os.getenv("ENABLE_OCR", "false").lower() == "true",
@@ -152,11 +211,20 @@ def load_settings_from_env() -> Settings:
         use_semantic_chunking=os.getenv("USE_SEMANTIC_CHUNKING", "true").lower() == "true",
 
         # Embedding
-        embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local"),
+        embedding_provider=os.getenv("EMBEDDING_PROVIDER", "OpenAI"),
         embedding_service_url=os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8001"),
         embedding_timeout_seconds=int(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "600")),
+        embedding_dimension=int(os.getenv("EMBEDDING_DIMENSION", "1536")),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         openai_model=os.getenv("OPENAI_MODEL", "text-embedding-3-small"),
+
+        # Qdrant
+        qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+        qdrant_api_key=os.getenv("QDRANT_API_KEY"),
+        qdrant_collection_name=os.getenv("QDRANT_COLLECTION_NAME", "medical_documents"),
+        qdrant_distance=os.getenv("QDRANT_DISTANCE", "Cosine"),
+        qdrant_timeout=float(os.getenv("QDRANT_TIMEOUT", "30.0")),
+        enable_qdrant=os.getenv("ENABLE_QDRANT", "true").lower() == "true",
 
         # Storage
         upload_dir=os.getenv("UPLOAD_DIR", "./uploads"),
@@ -187,14 +255,12 @@ class SettingsManager:
 
     Provides atomic access to settings, preventing race conditions
     when settings are updated while requests are in flight.
-
-    Mirrors the pattern from embedding-service/config.py
     """
 
     def __init__(self, initial: Optional[Settings] = None):
         self._settings: Settings = initial or load_settings_from_env()
         self._lock = threading.RLock()
-        self._version: int = 0  # Track changes for cache invalidation
+        self._version: int = 0
 
     @property
     def current(self) -> Settings:
@@ -223,7 +289,7 @@ class SettingsManager:
     def requires_restart(self, new_settings: Settings) -> bool:
         """Check if settings change requires service restart."""
         current = self.current
-        restart_keys = ["host", "port", "max_concurrent_jobs"]
+        restart_keys = ["host", "port", "max_concurrent_jobs", "qdrant_url"]
         return any(
             getattr(current, k) != getattr(new_settings, k)
             for k in restart_keys
@@ -238,7 +304,7 @@ class SettingsManager:
         pathlib.Path(current.cache_dir, "intermediate").mkdir(parents=True, exist_ok=True)
 
 
-# Global singleton - thread-safe by design
+# Global singleton
 settings_manager = SettingsManager()
 
 

@@ -1,283 +1,169 @@
 """
 Document Repository
 
-Handles document and chunk storage in PostgreSQL.
-Follows the repository pattern from embedding-service/database.py
-
-Provides:
-- Clean data access layer
-- Separation from business logic
-- Testability
+Handles document and chunk persistence.
+Updated to accept document_id for consistency with Qdrant.
 """
 
-import json
 import logging
+from datetime import datetime
 from typing import List, Optional, Dict, Any
-from uuid import UUID
-
-from app.models import Chunk
+import uuid
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DocumentRepository"]
+__all__ = ["DocumentRepository", "InMemoryDocumentStore"]
 
 
 class DocumentRepository:
     """
-    Repository for document and chunk operations.
+    Abstract document repository interface.
 
-    Follows the repository pattern from embedding-service to
-    separate data access from business logic.
-
-    Example:
-        repo = DocumentRepository(db_pool)
-        doc_id = await repo.create_document(title, source, content, metadata)
-        await repo.save_chunks(doc_id, chunks)
+    Implementations:
+    - InMemoryDocumentStore: For development/testing
+    - PostgresDocumentStore: For production (implement separately)
     """
 
-    def __init__(self, db_pool):
-        """
-        Initialize repository.
+    async def create_document(
+        self,
+        title: str,
+        source: str,
+        content: str,
+        metadata: Dict[str, Any],
+        document_id: Optional[str] = None,  # NEW: Accept specific ID
+    ) -> str:
+        """Create a document, returning its ID."""
+        raise NotImplementedError
 
-        Args:
-            db_pool: AsyncPG connection pool
-        """
-        self.db_pool = db_pool
-        logger.info("DocumentRepository initialized")
+    async def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
+        """Get a document by ID."""
+        raise NotImplementedError
+
+    async def save_chunks(self, document_id: str, chunks: List) -> int:
+        """Save chunks for a document."""
+        raise NotImplementedError
+
+    async def get_chunks(self, document_id: str) -> List[Dict[str, Any]]:
+        """Get all chunks for a document."""
+        raise NotImplementedError
+
+    async def delete_document(self, document_id: str) -> bool:
+        """Delete a document and its chunks."""
+        raise NotImplementedError
+
+
+# =============================================================================
+# In-Memory Implementation
+# =============================================================================
+
+# Global in-memory stores
+_documents_store: Dict[str, Dict[str, Any]] = {}
+_chunks_store: Dict[str, List[Dict[str, Any]]] = {}
+
+
+class InMemoryDocumentStore(DocumentRepository):
+    """
+    In-memory document storage for development/demo.
+
+    Replace with actual database in production.
+    """
 
     async def create_document(
-            self,
-            title: str,
-            source: str,
-            content: str,
-            metadata: Dict[str, Any]
+        self,
+        title: str,
+        source: str,
+        content: str,
+        metadata: Dict[str, Any],
+        document_id: Optional[str] = None,
     ) -> str:
-        """
-        Create a new document.
+        """Create a document with optional specific ID."""
+        # Use provided ID or generate new one
+        doc_id = document_id or str(uuid.uuid4())
 
-        Args:
-            title: Document title
-            source: Source path/URL
-            content: Full document content
-            metadata: Document metadata
+        _documents_store[doc_id] = {
+            "id": doc_id,
+            "title": title,
+            "source": source,
+            "content": content,
+            "content_length": len(content),
+            "metadata": metadata,
+            "created_at": datetime.utcnow().isoformat(),
+        }
 
-        Returns:
-            Document ID (UUID as string)
-        """
-        async with self.db_pool.acquire() as conn:
-            async with conn.transaction():
-                result = await conn.fetchrow(
-                    """
-                    INSERT INTO documents (title, source, content, metadata)
-                    VALUES ($1, $2, $3, $4) RETURNING id::text
-                    """,
-                    title,
-                    source,
-                    content,
-                    json.dumps(metadata)
-                )
+        logger.debug(f"Created document: {doc_id} ({title})")
+        return doc_id
 
-                document_id = result["id"]
-                logger.debug(f"Created document: {document_id}")
+    async def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
+        """Get a document by ID."""
+        return _documents_store.get(document_id)
 
-                return document_id
+    async def save_chunks(self, document_id: str, chunks: List) -> int:
+        """Save chunks for a document."""
+        if document_id not in _chunks_store:
+            _chunks_store[document_id] = []
 
-    async def get_document(
-            self,
-            document_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get document by ID.
+        saved_count = 0
 
-        Args:
-            document_id: Document UUID
+        for chunk in chunks:
+            chunk_data = {
+                "chunk_id": f"{document_id}-{chunk.index}",
+                "document_id": document_id,
+                "content": chunk.content,
+                "chunk_index": chunk.index,
+                "size": len(chunk.content),
+                "token_count": chunk.token_count if hasattr(chunk, 'token_count') else len(chunk.content) // 4,
+                "page_number": chunk.page_number if hasattr(chunk, 'page_number') else None,
+                "section_title": chunk.section_title if hasattr(chunk, 'section_title') else None,
+                "metadata": chunk.metadata or {},
+                "has_embedding": chunk.embedding is not None,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            _chunks_store[document_id].append(chunk_data)
+            saved_count += 1
 
-        Returns:
-            Document data or None if not found
-        """
-        async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id::text, title,
-                       source,
-                       content,
-                       metadata,
-                       created_at
-                FROM documents
-                WHERE id = $1::uuid
-                """,
-                document_id
-            )
+        logger.debug(f"Saved {saved_count} chunks for document {document_id}")
+        return saved_count
 
-            if not row:
-                return None
+    async def get_chunks(self, document_id: str) -> List[Dict[str, Any]]:
+        """Get all chunks for a document."""
+        chunks = _chunks_store.get(document_id, [])
+        # Sort by index
+        return sorted(chunks, key=lambda x: x.get("chunk_index", 0))
 
-            return dict(row)
+    async def delete_document(self, document_id: str) -> bool:
+        """Delete a document and its chunks."""
+        deleted = False
 
-    async def save_chunks(
-            self,
-            document_id: str,
-            chunks: List[Chunk]
-    ) -> int:
-        """
-        Save chunks for a document.
+        if document_id in _documents_store:
+            del _documents_store[document_id]
+            deleted = True
 
-        Args:
-            document_id: Document UUID
-            chunks: List of Chunk objects
+        if document_id in _chunks_store:
+            del _chunks_store[document_id]
 
-        Returns:
-            Number of chunks saved
-        """
-        if not chunks:
-            return 0
+        if deleted:
+            logger.debug(f"Deleted document: {document_id}")
 
-        async with self.db_pool.acquire() as conn:
-            async with conn.transaction():
-                saved = 0
+        return deleted
 
-                for chunk in chunks:
-                    # Prepare embedding data for PostgreSQL vector type
-                    embedding_data = None
-                    if chunk.embedding:
-                        # Format: '[1.0,2.0,3.0]' (no spaces after commas)
-                        embedding_data = '[' + ','.join(
-                            str(x) for x in chunk.embedding
-                        ) + ']'
+    async def list_documents(self) -> List[Dict[str, Any]]:
+        """List all documents (summary)."""
+        return [
+            {
+                "id": doc["id"],
+                "title": doc["title"],
+                "content_length": doc["content_length"],
+                "created_at": doc["created_at"],
+            }
+            for doc in _documents_store.values()
+        ]
 
-                    # Build chunk metadata
-                    chunk_metadata = chunk.metadata or {}
-                    chunk_metadata.update({
-                        "chunk_index": chunk.index,
-                        "chunk_size": chunk.size,
-                        "token_count": chunk.token_count,
-                        "page_number": chunk.page_number,
-                        "section_title": chunk.section_title,
-                    })
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get storage statistics."""
+        total_chunks = sum(len(chunks) for chunks in _chunks_store.values())
 
-                    # Insert chunk
-                    await conn.execute(
-                        """
-                        INSERT INTO chunks (document_id,
-                                            content,
-                                            embedding,
-                                            chunk_index,
-                                            metadata,
-                                            token_count)
-                        VALUES ($1::uuid, $2, $3::vector, $4, $5, $6)
-                        """,
-                        document_id,
-                        chunk.content,
-                        embedding_data,
-                        chunk.index,
-                        json.dumps(chunk_metadata),
-                        chunk.token_count
-                    )
-
-                    saved += 1
-
-                logger.debug(f"Saved {saved} chunks for document {document_id}")
-
-                return saved
-
-    async def get_chunks(
-            self,
-            document_id: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Get all chunks for a document.
-
-        Args:
-            document_id: Document UUID
-
-        Returns:
-            List of chunk dictionaries
-        """
-        async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id::text as chunk_id, content,
-                       chunk_index,
-                       metadata,
-                       token_count,
-                       embedding IS NOT NULL as has_embedding,
-                       created_at
-                FROM chunks
-                WHERE document_id = $1::uuid
-                ORDER BY chunk_index
-                """,
-                document_id
-            )
-
-            return [dict(row) for row in rows]
-
-    async def delete_document(
-            self,
-            document_id: str
-    ) -> bool:
-        """
-        Delete a document and its chunks.
-
-        Args:
-            document_id: Document UUID
-
-        Returns:
-            True if deleted, False if not found
-        """
-        async with self.db_pool.acquire() as conn:
-            async with conn.transaction():
-                # Delete chunks first (foreign key)
-                await conn.execute(
-                    "DELETE FROM chunks WHERE document_id = $1::uuid",
-                    document_id
-                )
-
-                # Delete document
-                result = await conn.execute(
-                    "DELETE FROM documents WHERE id = $1::uuid",
-                    document_id
-                )
-
-                # Check if any rows were deleted
-                deleted = result.split()[-1] != "0"
-
-                if deleted:
-                    logger.debug(f"Deleted document: {document_id}")
-
-                return deleted
-
-    async def list_documents(
-            self,
-            limit: int = 100,
-            offset: int = 0
-    ) -> List[Dict[str, Any]]:
-        """
-        List documents with pagination.
-
-        Args:
-            limit: Maximum number of documents to return
-            offset: Number of documents to skip
-
-        Returns:
-            List of document dictionaries
-        """
-        async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT d.id::text, d.title,
-                       d.source,
-                       d.metadata,
-                       d.created_at,
-                       COUNT(c.id) as chunk_count
-                FROM documents d
-                         LEFT JOIN chunks c ON d.id = c.document_id
-                GROUP BY d.id
-                ORDER BY d.created_at DESC
-                    LIMIT $1
-                OFFSET $2
-                """,
-                limit,
-                offset
-            )
-
-            return [dict(row) for row in rows]
+        return {
+            "documents_count": len(_documents_store),
+            "chunks_count": total_chunks,
+            "storage_type": "in_memory",
+        }

@@ -20,7 +20,7 @@ class LightOnOCRService:
     def __init__(
             self,
             # This should be your RunPod Proxy URL
-            endpoint_url: str = "https://9ldkyfwmuf18is-8000.proxy.runpod.net/v1/chat/completions",
+            endpoint_url: str = "https://mqrph4kl9d2186-8000.proxy.runpod.net/v1/chat/completions",
             dpi: int = 200
     ):
         self.endpoint_url = endpoint_url
@@ -69,7 +69,16 @@ class LightOnOCRService:
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Transcribe this page. Represent tables in Markdown format and math in LaTeX."},
+                        {
+                            "type": "text",
+                            # UPDATED PROMPT:
+                            "text": (
+                                "Transcribe this page into a Markdown table. "
+                                "Ignore headers/footers like address or phone numbers. "
+                                "At the bottom, add a section called '## Summary' and "
+                                "list any abnormal results (High/Low) in natural language sentences."
+                            )
+                        },
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}}
                     ]
                 }],

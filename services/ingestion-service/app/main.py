@@ -2,13 +2,13 @@
 Ingestion Service - Main Application
 
 A FastAPI microservice for document ingestion with:
-- PDF extraction using Docling
+- PDF extraction (Docling/LightOnOCR/Unstructured)
 - Intelligent chunking (semantic/recursive)
 - Embedding generation using local embedding service
+- Vector storage in Qdrant (NEW!)
+- Semantic search API (NEW!)
 - Job tracking and progress monitoring
 - Intermediate JSON file generation
-
-Follows the same architectural patterns as embedding-service/main.py
 
 Run with:
     uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
@@ -19,19 +19,23 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Local imports (clean imports with proper package structure)
+# Local imports
 from app.configs import settings_manager, load_settings_from_env
 from app.services.extraction import ExtractionService
 from app.services.chunking import ChunkingService
 from app.services.embedding import EmbeddingService
 from app.providers.embedding import get_embedding_provider
+from app.repositories.qdrant import QdrantRepository, QdrantConfig  # NEW
 from app.orchestrators.ingestion import IngestionOrchestrator
+from app.database import AsyncSessionLocal, engine, Base
+from app.repositories.postgres import PostgresJobRepository, PostgresDocumentRepository
 
-# Import routes (will be created next)
+# Import routes
 from app import routes
 
 # =============================================================================
@@ -51,8 +55,8 @@ logger = logging.getLogger(__name__)
 # Global Service Instances
 # =============================================================================
 
-# These will be initialized during startup
-orchestrator: IngestionOrchestrator = None
+orchestrator: Optional[IngestionOrchestrator] = None
+qdrant_repo: Optional[QdrantRepository] = None
 
 
 # =============================================================================
@@ -66,17 +70,18 @@ async def lifespan(app: FastAPI):
 
     Startup:
     1. Load configuration
-    2. Initialize services
-    3. Setup database (if configured)
-    4. Verify embedding service connection
+    2. Initialize embedding provider
+    3. Initialize Qdrant connection (NEW)
+    4. Initialize services
+    5. Initialize search service (NEW)
+    6. Setup storage
 
     Shutdown:
-    1. Close database connections
-    2. Cleanup resources
-
-    Mirrors the pattern from embedding-service/main.py
+    1. Close Qdrant connections
+    2. Close embedding provider
+    3. Cleanup resources
     """
-    global orchestrator, db_pool
+    global orchestrator, vector_search_service, qdrant_repo
 
     logger.info("=" * 70)
     logger.info("INGESTION SERVICE STARTUP")
@@ -89,20 +94,19 @@ async def lifespan(app: FastAPI):
     logger.info("Configuration loaded:")
     logger.info(f"  ├─ Embedding Provider: {settings.embedding_provider}")
     logger.info(f"  ├─ Embedding Service: {settings.embedding_service_url}")
+    logger.info(f"  ├─ Qdrant: {settings.qdrant_url} (enabled={settings.enable_qdrant})")
+    logger.info(f"  ├─ Collection: {settings.qdrant_collection_name}")
     logger.info(f"  ├─ Chunk Size: {settings.chunk_size}")
     logger.info(f"  ├─ Semantic Chunking: {'enabled' if settings.use_semantic_chunking else 'disabled'}")
-    logger.info(f"  ├─ OCR: {'enabled' if settings.enable_ocr else 'disabled'}")
-    logger.info(f"  ├─ Tables: {'enabled' if settings.include_tables else 'disabled'}")
     logger.info(f"  └─ Max File Size: {settings.max_file_size_mb}MB")
 
     # Create required directories
     settings_manager.ensure_directories()
-    logger.info(f"✓ Directories created:")
-    logger.info(f"  ├─ Upload: {settings.upload_dir}")
-    logger.info(f"  ├─ Cache: {settings.cache_dir}")
-    logger.info(f"  └─ Intermediate: {settings.cache_dir}/intermediate")
+    logger.info(f"✓ Directories created")
 
-    # Initialize embedding provider
+    # =========================================================================
+    # Initialize Embedding Provider
+    # =========================================================================
     try:
         logger.info(f"Initializing embedding provider: {settings.embedding_provider}")
 
@@ -113,14 +117,13 @@ async def lifespan(app: FastAPI):
                 timeout=settings.embedding_timeout_seconds
             )
 
-            # Check if embedding service is available
             is_healthy = await embedding_provider.health_check()
             if is_healthy:
-                logger.info(f"✓ Embedding service is available: {settings.embedding_service_url}")
+                logger.info(f"✓ Embedding service available: {settings.embedding_service_url}")
             else:
                 logger.warning(
-                    f"⚠ Embedding service is not responding: {settings.embedding_service_url}\n"
-                    f"  Semantic chunking may fail. Please ensure your embedding service is running."
+                    f"⚠ Embedding service not responding: {settings.embedding_service_url}\n"
+                    f"  Please ensure your embedding service is running."
                 )
 
         elif settings.embedding_provider == "OpenAI":
@@ -141,28 +144,60 @@ async def lifespan(app: FastAPI):
         logger.error(f"✗ Failed to initialize embedding provider: {e}")
         raise
 
-    # Initialize services
+    # =========================================================================
+    # Initialize Qdrant (NEW)
+    # =========================================================================
+    if settings.enable_qdrant:
+        try:
+            logger.info(f"Initializing Qdrant: {settings.qdrant_url}")
+
+            qdrant_config = QdrantConfig(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                collection_name=settings.qdrant_collection_name,
+                vector_size=settings.embedding_dimension,
+                distance=settings.qdrant_distance,
+                timeout=settings.qdrant_timeout,
+            )
+
+            qdrant_repo = QdrantRepository(qdrant_config)
+            await qdrant_repo.initialize()
+
+            # Get collection stats
+            stats = await qdrant_repo.get_collection_stats()
+            logger.info(
+                f"✓ Qdrant initialized: {stats.get('vectors_count', 0)} vectors "
+                f"in collection '{settings.qdrant_collection_name}'"
+            )
+
+        except Exception as e:
+            logger.error(f"✗ Failed to initialize Qdrant: {e}")
+            logger.warning("Continuing without Qdrant - vector search will be disabled")
+            qdrant_repo = None
+    else:
+        logger.info("Qdrant disabled by configuration")
+        qdrant_repo = None
+
+    # =========================================================================
+    # Initialize Services
+    # =========================================================================
     try:
         logger.info("Initializing services...")
 
-        # Extraction service (choose between Docling, LightOnOCR, and Unstructured)
+        # Extraction service
         if settings.extraction_service == "lighton_ocr":
             logger.info("Using LightOnOCR for PDF extraction")
             from app.ocr_extraction import LightOnOCRService
 
-            # Remote RunPod/vLLM endpoint (expects OpenAI-compatible /v1/chat/completions)
             endpoint_url = os.getenv(
                 "OCR_ENDPOINT_URL",
-                "https://9ldkyfwmuf18is-8000.proxy.runpod.net/v1/chat/completions",
+                "https://mqrph4kl9d2186-8000.proxy.runpod.net//v1/chat/completions",
             )
 
             extraction_service = LightOnOCRService(
                 endpoint_url=endpoint_url,
                 dpi=settings.ocr_dpi,
             )
-
-            # Initialize client (health/reachability)
-            logger.info("Initializing remote OCR endpoint...")
             await extraction_service.initialize()
             logger.info("✓ LightOnOCRService initialized")
 
@@ -171,8 +206,6 @@ async def lifespan(app: FastAPI):
             from app.services.unstructured_extraction import UnstructuredService, UnstructuredServiceOptimized
 
             if settings.enable_ocr:
-                # Use Unstructured's OCR path for scanned PDFs
-                logger.info("Unstructured configured for OCR (ocr_only strategy)")
                 extraction_service = UnstructuredService(
                     strategy="ocr_only",
                     extract_tables=True,
@@ -182,16 +215,12 @@ async def lifespan(app: FastAPI):
                     use_chunking=False,
                 )
             else:
-                # Default optimized extractor for native PDFs
                 extraction_service = UnstructuredServiceOptimized()
-
             logger.info("✓ UnstructuredService initialized")
 
         else:
             # Default: Docling
             logger.info("Using Docling for PDF extraction")
-            from app.services.extraction import ExtractionService
-
             extraction_service = ExtractionService(
                 enable_ocr=settings.enable_ocr,
                 images_scale=settings.images_scale,
@@ -214,93 +243,38 @@ async def lifespan(app: FastAPI):
         # Embedding service
         embedding_service = EmbeddingService(
             provider=embedding_provider,
-            batch_size=32  # Can be made configurable
+            batch_size=32
         )
         logger.info("✓ EmbeddingService initialized")
+
+        # Vector search service (NEW)
 
     except Exception as e:
         logger.error(f"✗ Failed to initialize services: {e}")
         raise
 
-    # Initialize database
-    logger.info("=" * 70)
-    logger.info("DATABASE INITIALIZATION")
-    logger.info("=" * 70)
+    # =========================================================================
+    # Initialize Storage Repositories
+    # =========================================================================
+    # Use in-memory for development (replace with PostgreSQL for production)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
+    # 2. Initialize Repositories with the session factory
+    global job_repo, document_repo
+    job_repo = PostgresJobRepository(AsyncSessionLocal)
+    document_repo = PostgresDocumentRepository(AsyncSessionLocal)
 
-    from app.repositories.document import DocumentRepository
-    from app.repositories.job import JobRepository
-
-    # Check if database is configured
-    database_url = os.getenv("DATABASE_URL")
-
-    if not database_url:
-        logger.warning(
-            "⚠ DATABASE_URL not configured!\n"
-            "  Using in-memory storage (data will be lost on restart)\n"
-            "  For production, set DATABASE_URL in .env file\n"
-            "  Example: DATABASE_URL=postgresql://user:pass@localhost/ingestion_db"
-        )
-
-        # Use in-memory storage
-        from app.storage import InMemoryJobStore, InMemoryDocumentStore
-        job_repo = InMemoryJobStore()
-        document_repo = InMemoryDocumentStore()
-        logger.info("✓ Using in-memory storage (demo mode)")
-
-    else:
-        # Use PostgreSQL
-        logger.info(f"Database URL: {database_url.split('@')[0]}@***")
-
-        db_manager = DatabaseManager(
-            database_url=database_url,
-            min_size=int(os.getenv("DB_POOL_MIN_SIZE", "10")),
-            max_size=int(os.getenv("DB_POOL_MAX_SIZE", "20"))
-        )
-
-        try:
-            # Initialize connection pool
-            await db_manager.initialize()
-
-            # Run schema migrations if requested
-            if os.getenv("AUTO_MIGRATE", "false").lower() == "true":
-                logger.info("Running database migrations...")
-                schema_path = Path("sql/schema.sql")
-                if schema_path.exists():
-                    with open(schema_path, 'r') as f:
-                        schema_sql = f.read()
-                    await db_manager.execute_script(schema_sql)
-                    logger.info("✓ Database schema initialized")
-                else:
-                    logger.warning(f"Schema file not found: {schema_path}")
-
-            # Set global database manager
-            set_database_manager(db_manager)
-
-            # Create repositories
-            job_repo = JobRepository(db_manager)
-            document_repo = DocumentRepository(db_manager)
-
-            logger.info("✓ PostgreSQL initialized successfully")
-
-        except Exception as e:
-            logger.error(f"✗ Failed to initialize PostgreSQL: {e}")
-            logger.warning("Falling back to in-memory storage")
-
-            # Fallback to in-memory
-            from app.storage import InMemoryJobStore, InMemoryDocumentStore
-            job_repo = InMemoryJobStore()
-            document_repo = InMemoryDocumentStore()
-
-    logger.info("=" * 70)
-
-    # Initialize orchestrator
+    # =========================================================================
+    # Initialize Orchestrator
+    # =========================================================================
     orchestrator = IngestionOrchestrator(
         extraction_service=extraction_service,
         chunking_service=chunking_service,
         embedding_service=embedding_service,
         document_repo=document_repo,
         job_repo=job_repo,
+        qdrant_repo=qdrant_repo,  # NEW
         cache_dir=settings.cache_dir
     )
     logger.info("✓ IngestionOrchestrator initialized")
@@ -309,33 +283,31 @@ async def lifespan(app: FastAPI):
     logger.info(f"SERVICE READY: http://{settings.host}:{settings.port}")
     logger.info(f"API Documentation: http://{settings.host}:{settings.port}/docs")
     logger.info(f"Health Check: http://{settings.host}:{settings.port}/health")
+    if qdrant_repo:
+        logger.info(f"Search API: http://{settings.host}:{settings.port}/search")
     logger.info("=" * 70)
 
-    # Application is now running
+    # Application runs here
     yield
 
+    await engine.dispose()
+
+    # =========================================================================
     # Shutdown
+    # =========================================================================
     logger.info("=" * 70)
     logger.info("INGESTION SERVICE SHUTDOWN")
     logger.info("=" * 70)
+
+    # Close Qdrant
+    if qdrant_repo:
+        await qdrant_repo.close()
+        logger.info("✓ Qdrant connections closed")
 
     # Close embedding provider
     if hasattr(embedding_provider, 'close'):
         await embedding_provider.close()
         logger.info("✓ Embedding provider closed")
-
-    database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        try:
-            from app.database import get_database_manager
-            db_manager = get_database_manager()
-            if db_manager:
-                await db_manager.close()
-                logger.info("✓ Database connections closed")
-        except ImportError:
-            logger.warning("Database module not found, skipping DB shutdown.")
-    else:
-        logger.info("✓ In-memory storage used; no database connections to close.")
 
     logger.info("=" * 70)
     logger.info("SHUTDOWN COMPLETE")
@@ -346,23 +318,23 @@ async def lifespan(app: FastAPI):
 # FastAPI Application
 # =============================================================================
 
-# Load initial settings for app metadata
 _initial_settings = load_settings_from_env()
 
 app = FastAPI(
     title="Ingestion Service",
     description="""
-    ## Production-Ready Document Ingestion Microservice
+    ## Document Ingestion Microservice with Vector Search
     
-    Process documents with advanced extraction and chunking for RAG systems.
+    Process documents with advanced extraction, chunking, and vector storage.
     
     ### Key Features
-    - 🔍 **PDF Extraction**: High-quality extraction using Docling
+    - 🔍 **PDF Extraction**: Docling, LightOnOCR, or Unstructured
     - 📊 **Table Preservation**: Maintains table structure
     - 🧩 **Smart Chunking**: Semantic and recursive strategies
     - 🔗 **Local Embeddings**: Integrates with your embedding microservice
-    - 📁 **Intermediate Files**: Inspect results before vector DB
-    - 📈 **Job Tracking**: Real-time progress monitoring
+    - 🗄️ **Vector Storage**: Qdrant with rich metadata (NEW!)
+    - 🔎 **Semantic Search**: Search API for RAG (NEW!)
+    - 📁 **Intermediate Files**: Inspect results before committing
     
     ### Endpoints
     
@@ -372,24 +344,24 @@ app = FastAPI(
     - `GET /jobs/{job_id}/chunks` - Retrieve processed chunks
     - `GET /jobs/{job_id}/intermediate` - Download intermediate JSON
     
+    **Search (NEW)**
+    - `POST /search` - Semantic search across documents
+    - `GET /search/stats` - Search service statistics
+    
     **Monitoring**
     - `GET /health` - Service health status
     - `GET /metrics` - Processing metrics
     
-    ### Integration with Embedding Service
+    ### Integration with Chat Service
     
-    This service integrates seamlessly with your embedding microservice
-    running on port 8001. Set `EMBEDDING_PROVIDER=local` in your environment
-    to use your local service instead of OpenAI.
-    
-    ```bash
-    # Use your local embedding service (recommended!)
-    export EMBEDDING_PROVIDER=local
-    export EMBEDDING_SERVICE_URL=http://localhost:8001
-    
-    # Or use OpenAI (fallback)
-    export EMBEDDING_PROVIDER=openai
-    export OPENAI_API_KEY=sk-...
+    Your Chat Service can call the search endpoint:
+    ```python
+    response = await httpx.post(
+        "http://localhost:8002/search",
+        json={"query": "patient lab results", "top_k": 5}
+    )
+    context = response.json()["context_string"]
+    citations = response.json()["citations"]
     ```
     """,
     version=_initial_settings.service_version,
@@ -408,7 +380,7 @@ app.add_middleware(
 )
 
 # Include routes
-app.include_router(routes.router)
+app.include_router(routes.router)  # NEW
 
 
 # =============================================================================
@@ -417,19 +389,24 @@ app.include_router(routes.router)
 
 @app.get("/", tags=["Root"])
 async def root():
-    """
-    Root endpoint with service information.
-
-    Returns:
-        Service metadata and useful links
-    """
+    """Root endpoint with service information."""
     settings = settings_manager.current
 
-    # Get embedding service status
+    # Get service status
     embedding_status = "unknown"
+    qdrant_status = "disabled"
+    vectors_count = 0
+
     if orchestrator and orchestrator.embedding_service:
         is_healthy = await orchestrator.embedding_service.health_check()
         embedding_status = "healthy" if is_healthy else "unavailable"
+
+    if qdrant_repo:
+        is_healthy = await qdrant_repo.health_check()
+        qdrant_status = "healthy" if is_healthy else "unavailable"
+        if is_healthy:
+            stats = await qdrant_repo.get_collection_stats()
+            vectors_count = stats.get("vectors_count", 0)
 
     return {
         "service": settings.service_name,
@@ -437,10 +414,21 @@ async def root():
         "status": "running",
         "documentation": "/docs",
         "health": "/health",
-        "metrics": "/metrics",
+        "search": "/search" if qdrant_repo else None,
+
+        # Integration info
         "embedding_provider": settings.embedding_provider,
         "embedding_service": settings.embedding_service_url,
-        "embedding_service_status": embedding_status,
+        "embedding_status": embedding_status,
+
+        # Qdrant info
+        "qdrant_enabled": settings.enable_qdrant,
+        "qdrant_url": settings.qdrant_url if settings.enable_qdrant else None,
+        "qdrant_status": qdrant_status,
+        "qdrant_collection": settings.qdrant_collection_name,
+        "vectors_indexed": vectors_count,
+
+        # Processing info
         "chunking_strategy": "semantic" if settings.use_semantic_chunking else "recursive",
     }
 
@@ -450,12 +438,9 @@ async def root():
 # =============================================================================
 
 if __name__ == "__main__":
-    import os
     import uvicorn
 
     settings = load_settings_from_env()
-
-    # Determine environment
     is_development = os.getenv("ENVIRONMENT", "development") == "development"
 
     uvicorn.run(
@@ -463,7 +448,7 @@ if __name__ == "__main__":
         host=settings.host,
         port=settings.port,
         reload=is_development,
-        workers=1,  # Important: Docling is not fork-safe
+        workers=1,
         log_level="info",
         access_log=True,
     )
