@@ -725,7 +725,7 @@ class MessageRepository:
                     chunk.get("filename", "unknown"),
                     chunk.get("page_number"),
                     chunk.get("section_title"),
-                    chunk.get("content", "")[:500],
+                    chunk.get("content", ""),
                     len(chunk.get("content", "")),
                     was_cited,
                     citation_number,

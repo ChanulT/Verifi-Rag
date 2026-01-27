@@ -1,19 +1,19 @@
 """
-LangGraph RAG Workflow with Chunk Storage.
+LangGraph RAG Workflow - WITH TEMPORAL QUERY SUPPORT
 
-Enhanced to expose retrieved chunks for database storage,
-enabling per-message citation tracking.
+NEW: Extracts temporal information and filters search by years
 """
 
 import logging
 import time
 import uuid
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import httpx
 
 from app.config import settings_manager
-from app.graph.state import RAGState, WorkflowStatus, QueryType
+from app.graph.state import RAGState, WorkflowStatus, QueryType, TemporalFilter
 from app.models import RetrievedChunk, ChatResponse, CitationDisplay, ResponseStatus
 from app.llm.openai_client import OpenAIClient, get_openai_client
 
@@ -21,6 +21,111 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["RAGWorkflow", "create_rag_workflow", "SearchServiceClient"]
 
+
+# =============================================================================
+# NEW: Temporal Pattern Extraction (Fallback)
+# =============================================================================
+
+def extract_temporal_patterns(query: str) -> TemporalFilter:
+    """
+    Extract temporal information from query using regex patterns.
+
+    This is a FALLBACK if LLM doesn't extract temporal info.
+
+    Examples:
+        "last 3 years" → years=[2023, 2024, 2025]
+        "in 2024" → years=[2024]
+        "current WBC" → prefer_latest=True
+    """
+    current_year = datetime.now().year
+    query_lower = query.lower()
+    years = []
+    prefer_latest = False
+
+    # Pattern 1: Specific year mentions ("in 2024", "from 2023")
+    year_pattern = r'\b(20\d{2})\b'
+    year_matches = re.findall(year_pattern, query)
+    if year_matches:
+        years.extend([int(y) for y in year_matches])
+
+    # Pattern 2: "last N years" / "past N years"
+    last_years_pattern = r'\b(?:last|past)\s+(\d+)\s+years?\b'
+    last_years_match = re.search(last_years_pattern, query_lower)
+    if last_years_match:
+        n = int(last_years_match.group(1))
+        years.extend(range(current_year - n, current_year))
+
+    # Pattern 3: "between YEAR1 and YEAR2"
+    between_pattern = r'\bbetween\s+(20\d{2})\s+and\s+(20\d{2})\b'
+    between_match = re.search(between_pattern, query_lower)
+    if between_match:
+        year1, year2 = int(between_match.group(1)), int(between_match.group(2))
+        years.extend(range(min(year1, year2), max(year1, year2) + 1))
+
+    # Pattern 4: Recency indicators
+    recency_keywords = [
+        'current', 'latest', 'most recent', 'now', 'today',
+        'this year', 'recent'
+    ]
+    if any(keyword in query_lower for keyword in recency_keywords):
+        prefer_latest = True
+
+    # Remove duplicates and sort
+    years = sorted(set(years))
+
+    logger.info(f"Temporal extraction: years={years}, prefer_latest={prefer_latest}")
+
+    return TemporalFilter(
+        years=years,
+        prefer_latest=prefer_latest
+    )
+
+
+def filter_to_latest_year(chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+    """
+    Filter chunks to only the most recent year.
+
+    Used when user asks for "current" or "latest" values.
+    """
+    if not chunks:
+        return chunks
+
+    # Extract years from chunks
+    chunks_with_years = []
+    for chunk in chunks:
+        year = None
+        # Try to get year from chunk (you may need to add this field)
+        # For now, assume it might be in metadata or content
+        # You'll need to modify based on your actual chunk structure
+        if hasattr(chunk, 'year'):
+            year = chunk.year
+        elif hasattr(chunk, 'metadata') and isinstance(chunk.metadata, dict):
+            year = chunk.metadata.get('year')
+
+        if year:
+            chunks_with_years.append((chunk, year))
+
+    if not chunks_with_years:
+        # No year info, return all chunks
+        return chunks
+
+    # Find latest year
+    latest_year = max(year for _, year in chunks_with_years)
+
+    # Keep only chunks from latest year
+    filtered = [chunk for chunk, year in chunks_with_years if year == latest_year]
+
+    logger.info(
+        f"Filtered to latest year {latest_year}: "
+        f"{len(filtered)}/{len(chunks)} chunks"
+    )
+
+    return filtered or chunks  # Fallback to all if filtering fails
+
+
+# =============================================================================
+# Search Service Client
+# =============================================================================
 
 class SearchServiceClient:
     """Client for the search/ingestion service."""
@@ -33,12 +138,22 @@ class SearchServiceClient:
     async def search(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 7,
         score_threshold: float = 0.3,
         document_ids: Optional[List[str]] = None,
+        filter_years: Optional[List[int]] = None,  # NEW!
     ) -> tuple[List[RetrievedChunk], List[Dict]]:
         """
         Search for relevant chunks.
+
+        NEW: Supports year filtering!
+
+        Args:
+            query: Search query
+            top_k: Number of results
+            score_threshold: Minimum score
+            document_ids: Document filter
+            filter_years: NEW - Filter by years [2023, 2024, 2025]
 
         Returns:
             Tuple of (RetrievedChunk list, raw dict list for storage)
@@ -53,6 +168,11 @@ class SearchServiceClient:
             if document_ids:
                 payload["filter_document_ids"] = document_ids
 
+            # NEW: Add year filtering
+            if filter_years:
+                payload["filter_years"] = filter_years
+                logger.info(f"Filtering search to years: {filter_years}")
+
             response = await self.client.post(
                 f"{self.base_url}/search",
                 json=payload,
@@ -65,7 +185,6 @@ class SearchServiceClient:
             raw_chunks = []
 
             for result in data.get("results", []):
-                # Create RetrievedChunk for processing
                 chunk = RetrievedChunk(
                     chunk_id=result.get("chunk_id", ""),
                     document_id=result.get("document_id", ""),
@@ -74,14 +193,15 @@ class SearchServiceClient:
                     filename=result.get("filename", "unknown"),
                     page_number=result.get("page_number"),
                     section_title=result.get("section_title"),
-                    content_preview=result.get("content_preview", ""),
+                    content_preview=result.get("content", ""),
                 )
                 chunks.append(chunk)
-
-                # Keep raw dict for database storage
                 raw_chunks.append(result)
 
-            logger.info(f"Retrieved {len(chunks)} chunks")
+            logger.info(
+                f"Retrieved {len(chunks)} chunks "
+                f"(years={filter_years if filter_years else 'all'})"
+            )
             return chunks, raw_chunks
 
         except httpx.HTTPError as e:
@@ -104,8 +224,16 @@ class SearchServiceClient:
         await self.client.aclose()
 
 
+# =============================================================================
+# Workflow Nodes
+# =============================================================================
+
 async def analyze_query_node(state: RAGState, llm: OpenAIClient) -> RAGState:
-    """Analyze the user query."""
+    """
+    Analyze the user query.
+
+    NEW: Extracts temporal information from the query.
+    """
     start = time.time()
     state.status = WorkflowStatus.ANALYZING
 
@@ -123,12 +251,24 @@ async def analyze_query_node(state: RAGState, llm: OpenAIClient) -> RAGState:
         if state.query_type == QueryType.OUT_OF_SCOPE:
             state.needs_retrieval = False
 
+        # NEW: Extract temporal information
+        # Use regex fallback (you can enhance this with LLM later)
+        state.temporal_filter = extract_temporal_patterns(state.user_query)
+
         state.step_timings["analyze"] = (time.time() - start) * 1000
+
+        logger.info(
+            f"Query analysis: type={state.query_type}, "
+            f"years={state.temporal_filter.years}, "
+            f"prefer_latest={state.temporal_filter.prefer_latest}"
+        )
 
     except Exception as e:
         logger.error(f"Query analysis failed: {e}")
         state.search_query = state.user_query
         state.needs_retrieval = True
+        # Fallback temporal extraction
+        state.temporal_filter = extract_temporal_patterns(state.user_query)
 
     return state
 
@@ -139,6 +279,8 @@ async def retrieve_context_node(
 ) -> tuple[RAGState, List[Dict]]:
     """
     Retrieve relevant chunks.
+
+    NEW: Passes temporal filters to search service.
 
     Returns:
         Tuple of (state, raw_chunks for database storage)
@@ -154,12 +296,19 @@ async def retrieve_context_node(
     settings = settings_manager.current
 
     try:
+        # NEW: Pass temporal filters to search
         chunks, raw_chunks = await search_client.search(
             query=state.search_query,
             top_k=settings.retrieval_top_k,
             score_threshold=settings.retrieval_score_threshold,
-            document_ids=state.document_filter if state.document_filter else None,
+            document_ids=[],  # ALWAYS search ALL documents
+            filter_years=state.temporal_filter.years if state.temporal_filter.years else None,  # NEW!
         )
+
+        # NEW: If prefer_latest, filter to most recent year
+        if state.temporal_filter.prefer_latest and chunks:
+            chunks = filter_to_latest_year(chunks)
+            logger.info(f"Applied recency filter (prefer_latest=True)")
 
         state.retrieved_chunks = chunks
         state.retrieval_scores = [c.score for c in chunks]
@@ -269,11 +418,15 @@ def finalize_response_node(state: RAGState) -> RAGState:
     return state
 
 
+# =============================================================================
+# RAG Workflow
+# =============================================================================
+
 class RAGWorkflow:
     """
-    RAG Workflow with chunk storage support.
+    RAG Workflow with temporal query support.
 
-    Exposes retrieved chunks for database storage.
+    NEW: Automatically detects and applies temporal filters.
     """
 
     def __init__(
@@ -283,11 +436,9 @@ class RAGWorkflow:
     ):
         self.llm = llm
         self.search_client = search_client
-
-        # Store last retrieved chunks for database persistence
         self._last_retrieved_chunks: List[Dict] = []
 
-        logger.info("RAG Workflow initialized")
+        logger.info("RAG Workflow initialized with temporal support")
 
     async def run(
         self,
@@ -300,8 +451,7 @@ class RAGWorkflow:
         """
         Run the RAG workflow.
 
-        After running, access self._last_retrieved_chunks to get
-        the raw chunks for database storage.
+        NEW: Automatically handles temporal queries!
         """
         state = RAGState(
             user_query=query,
@@ -311,14 +461,13 @@ class RAGWorkflow:
             chat_history=chat_history or [],
         )
 
-        # Clear previous chunks
         self._last_retrieved_chunks = []
 
         try:
-            # Step 1: Analyze query
+            # Step 1: Analyze query (now extracts temporal info)
             state = await analyze_query_node(state, self.llm)
 
-            # Step 2: Retrieve context
+            # Step 2: Retrieve context (now uses temporal filters)
             if state.needs_retrieval:
                 state, raw_chunks = await retrieve_context_node(state, self.search_client)
                 self._last_retrieved_chunks = raw_chunks
@@ -355,13 +504,11 @@ class RAGWorkflow:
         else:
             status = ResponseStatus.SUCCESS
 
-        # Build citation displays
         citations_display = []
         for i, chunk in enumerate(state.get_top_chunks(len(state.cited_chunk_indices or []))):
             if (i + 1) in (state.cited_chunk_indices or []):
                 citations_display.append(chunk.to_citation_display(i + 1))
 
-        # Include top chunks as citations if none explicit
         if not citations_display and state.retrieved_chunks:
             for i, chunk in enumerate(state.get_top_chunks(3), 1):
                 citations_display.append(chunk.to_citation_display(i))
@@ -381,11 +528,7 @@ class RAGWorkflow:
         )
 
     def get_last_retrieved_chunks(self) -> List[Dict]:
-        """
-        Get the raw chunks from the last run.
-
-        Use this to save chunks to the database.
-        """
+        """Get the raw chunks from the last run."""
         return self._last_retrieved_chunks
 
 

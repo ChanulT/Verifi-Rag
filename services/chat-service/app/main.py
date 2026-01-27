@@ -17,11 +17,11 @@ import logging
 import os
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Literal
 
-from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings_manager, load_settings_from_env
@@ -29,9 +29,6 @@ from app.models import (
     ChatRequest,
     ChatResponse,
     HealthStatus,
-    MessageRole,
-    ResponseStatus,
-    CitationDisplay,
 )
 from app.llm.openai_client import initialize_openai_client, OpenAIClient
 from app.graph.workflow import RAGWorkflow, SearchServiceClient
@@ -40,7 +37,6 @@ from app.database.mysql import (
     SessionRepository,
     MessageRepository,
     set_database_manager,
-    get_database_manager,
 )
 
 # =============================================================================
@@ -68,7 +64,7 @@ session_repo: Optional[SessionRepository] = None
 message_repo: Optional[MessageRepository] = None
 
 # Track service start time
-_start_time: datetime = None
+_start_time: Optional[datetime] = None
 
 
 # =============================================================================
@@ -81,7 +77,7 @@ async def lifespan(app: FastAPI):
     global rag_workflow, search_client, llm_client, db_manager
     global session_repo, message_repo, _start_time
 
-    _start_time = datetime.utcnow()
+    _start_time = datetime.now(timezone.utc)
 
     logger.info("=" * 70)
     logger.info("CHAT SERVICE STARTUP")
@@ -309,7 +305,7 @@ async def root():
     db_status = "connected" if db_manager and await db_manager.health_check() else "not connected"
     search_status = "healthy" if search_client and await search_client.health_check() else "unavailable"
 
-    uptime = (datetime.utcnow() - _start_time).total_seconds() if _start_time else 0
+    uptime = (datetime.now(timezone.utc) - _start_time).total_seconds() if _start_time else 0
 
     return {
         "service": settings.service_name,
@@ -592,17 +588,17 @@ async def health_check():
     llm_healthy = llm_client and await llm_client.health_check()
     search_healthy = search_client and await search_client.health_check()
 
-    overall = "healthy"
+    overall_health: Literal["healthy", "degraded", "unhealthy"] = "healthy"
     if not (db_healthy and llm_healthy and search_healthy):
-        overall = "degraded"
+        overall_health = "degraded"
     if not llm_healthy:
-        overall = "unhealthy"
+        overall_health = "unhealthy"
 
-    uptime = (datetime.utcnow() - _start_time).total_seconds() if _start_time else 0
+    uptime = (datetime.now(timezone.utc) - _start_time).total_seconds() if _start_time else 0
 
     return HealthStatus(
         service=settings.service_name,
-        status=overall,
+        status=overall_health,
         version=settings.service_version,
         uptime_seconds=uptime,
         dependencies={

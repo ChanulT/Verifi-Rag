@@ -1,7 +1,7 @@
 """
-Qdrant Repository
+Qdrant Repository - WITH YEAR FILTERING SUPPORT
 
-Handles direct interactions with the Qdrant Vector Database.
+NEW: Supports filtering chunks by year metadata
 """
 import os
 import logging
@@ -10,8 +10,6 @@ from dataclasses import dataclass
 
 from qdrant_client import QdrantClient, models
 from qdrant_client.http import models as rest
-
-# Load environment variables
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,6 +29,7 @@ class VectorSearchResult:
     page_number: Optional[int] = None
     section_title: Optional[str] = None
     total_pages: Optional[int] = None
+    document_year: Optional[int] = None  # NEW!
 
     @property
     def content_preview(self) -> str:
@@ -47,7 +46,8 @@ class VectorSearchResult:
             "section": self.section_title,
             "text": self.content,
             "preview": self.content_preview,
-            "relevance_score": self.score
+            "relevance_score": self.score,
+            "year": self.document_year  # NEW!
         }
 
 
@@ -57,7 +57,6 @@ class QdrantRepository:
         self.api_key = os.getenv("QDRANT_API_KEY", None)
         self.collection_name = os.getenv("QDRANT_COLLECTION_NAME", "medical_documents")
 
-        # Initialize client
         self.client = QdrantClient(
             url=self.url,
             api_key=self.api_key,
@@ -71,8 +70,21 @@ class QdrantRepository:
             score_threshold: float = 0.0,
             filter_document_ids: Optional[List[str]] = None,
             filter_filenames: Optional[List[str]] = None,
+            filter_years: Optional[List[int]] = None,  # NEW!
     ) -> List[VectorSearchResult]:
-        """Search for vectors similar to the query embedding."""
+        """
+        Search for vectors similar to the query embedding.
+
+        NEW: Supports year filtering for temporal queries!
+
+        Args:
+            query_embedding: Query vector
+            top_k: Number of results
+            score_threshold: Minimum score
+            filter_document_ids: Filter by document IDs
+            filter_filenames: Filter by filenames
+            filter_years: NEW - Filter by years [2023, 2024, 2025]
+        """
 
         # Build filters
         must_filters = []
@@ -93,26 +105,45 @@ class QdrantRepository:
                 )
             )
 
+        # NEW: Year filtering
+        if filter_years:
+            must_filters.append(
+                models.FieldCondition(
+                    key="document_year",
+                    match=models.MatchAny(any=filter_years)
+                )
+            )
+            logger.info(f"Applying year filter: {filter_years}")
+
         # Create the filter object
-        # Note: We assign this to a variable named 'q_filter' to avoid confusion
-        # with the argument name 'query_filter' or the built-in 'filter' function
         q_filter = models.Filter(must=must_filters) if must_filters else None
 
         # Execute search
         response = self.client.query_points(
             collection_name=self.collection_name,
             query=query_embedding,
-            query_filter=q_filter,  # <--- CHANGED: Use 'query_filter', not 'filter'
+            query_filter=q_filter,
             limit=top_k,
             score_threshold=score_threshold,
-            with_payload=True,  # Ensure payload (content) is returned
+            with_payload=True,
         )
 
         # Map results
-        return [self._map_scited_point(point) for point in response.points]
+        results = [self._map_scored_point(point) for point in response.points]
 
-    def _map_scited_point(self, point: models.ScoredPoint) -> VectorSearchResult:
-        """Map Qdrant ScoredPoint to VectorSearchResult."""
+        logger.info(
+            f"Search completed: {len(results)} results "
+            f"(years={filter_years if filter_years else 'all'})"
+        )
+
+        return results
+
+    def _map_scored_point(self, point: models.ScoredPoint) -> VectorSearchResult:
+        """
+        Map Qdrant ScoredPoint to VectorSearchResult.
+
+        NEW: Extracts year from payload.
+        """
         payload = point.payload or {}
         return VectorSearchResult(
             chunk_id=point.id,
@@ -123,7 +154,8 @@ class QdrantRepository:
             chunk_index=payload.get("chunk_index", 0),
             page_number=payload.get("page_number"),
             section_title=payload.get("section_title"),
-            total_pages=payload.get("total_pages")
+            total_pages=payload.get("total_pages"),
+            document_year=payload.get("document_year")  # NEW!
         )
 
     async def delete_document(self, document_id: str):

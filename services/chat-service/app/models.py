@@ -339,7 +339,7 @@ class RetrievedChunk:
             source_file=self.filename,
             page_number=self.page_number,
             section_title=self.section_title,
-            text_snippet=self.content_preview or self.content[:200],
+            text_snippet=self.content_preview,
             relevance_score=self.score,
         )
 
@@ -350,7 +350,7 @@ class RetrievedChunk:
             source=self.filename,
             page=self.page_number,
             section=self.section_title,
-            snippet=self.content_preview or self.content[:150] + "...",
+            snippet=self.content_preview ,
         )
 
 

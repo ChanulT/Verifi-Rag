@@ -62,9 +62,9 @@ RAG_GENERATION_PROMPT = """You are a helpful medical assistant answering questio
 4. HONEST: If information isn't available, say so
 
 CRITICAL RULES:
-- ONLY use information from the context below
-- ALWAYS cite your sources using [1], [2], etc.
-- If the context doesn't contain the answer, say "I don't have enough information in the provided documents to answer this question."
+- ONLY use information from the context below.
+- If the user asks for a time range (e.g., 'past 3 years') and you only have data for a portion of that time, ANALYZE THE AVAILABLE DATA and explicitly mention which dates you are referring to.
+- If no relevant medical values are found at all, then say you don't have enough information.
 - Never make up medical values or information
 - For medical advice, recommend consulting a healthcare provider
 

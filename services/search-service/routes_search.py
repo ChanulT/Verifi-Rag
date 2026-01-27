@@ -1,9 +1,7 @@
 """
-Search Routes - Updated to Include Date/Year
+Search Routes - WITH YEAR FILTERING SUPPORT
 
-Changes:
-- SearchResult model includes document_date and document_year
-- Search endpoint returns date/year for temporal queries
+NEW: Accepts filter_years parameter for temporal queries
 """
 
 import logging
@@ -23,17 +21,24 @@ router = APIRouter(prefix="/search", tags=["Search"])
 # =============================================================================
 
 class SearchRequest(BaseModel):
-    """Search request."""
+    """
+    Search request.
+
+    NEW: Added filter_years for temporal queries!
+    """
     query: str = Field(..., min_length=1, max_length=1000)
     top_k: int = Field(default=5, ge=1, le=20)
     score_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+
     filter_document_ids: Optional[List[str]] = Field(
         None,
         description="Filter to specific documents. None = search all."
     )
-    year_filter: Optional[int] = Field(
+
+    # NEW: Year filtering for temporal queries!
+    filter_years: Optional[List[int]] = Field(
         None,
-        description="Filter to specific year (e.g., 2023)"
+        description="Filter to specific years (e.g., [2023, 2024, 2025])"
     )
 
 
@@ -50,9 +55,8 @@ class SearchResult(BaseModel):
     section_title: Optional[str] = None
     content_preview: str = ""
 
-    # Date/year for temporal queries
-    document_date: Optional[str] = Field(None, description="ISO date: 2023-05-15")
-    document_year: Optional[int] = Field(None, description="Year: 2023")
+    # NEW: Year for temporal queries
+    year: Optional[int] = Field(None, description="Year from chunk metadata")
 
     chunk_index: int = 0
 
@@ -64,8 +68,7 @@ class CitationInfo(BaseModel):
     page: Optional[int] = None
     section: Optional[str] = None
     snippet: str
-    year: Optional[int] = None  # NEW
-    date: Optional[str] = None  # NEW
+    year: Optional[int] = None  # NEW!
 
 
 class SearchResponse(BaseModel):
@@ -81,10 +84,22 @@ class SearchResponse(BaseModel):
 # =============================================================================
 
 @router.post("", response_model=SearchResponse)
-@router.post("", response_model=SearchResponse)
-async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_req
+async def search(request: SearchRequest, fastapi_req: Request):
+    """
+    Search with optional year filtering.
 
-    # Access the service from app.state (initialized in main.py)
+    NEW: Supports filter_years parameter for temporal queries!
+
+    Example:
+    ```json
+    {
+        "query": "What is my WBC count?",
+        "top_k": 5,
+        "filter_years": [2024, 2025]  // Only search 2024-2025 chunks!
+    }
+    ```
+    """
+    # Access the service from app.state
     vector_service = getattr(fastapi_req.app.state, "vector_service", None)
 
     if not vector_service:
@@ -94,15 +109,16 @@ async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_r
         )
 
     try:
-        # Create the SearchQuery object expected by vector_service.search
+        # Create SearchQuery with year filter
         query_params = SearchQuery(
             query=request.query,
             top_k=request.top_k,
             score_threshold=request.score_threshold,
-            filter_document_ids=request.filter_document_ids
+            filter_document_ids=request.filter_document_ids,
+            filter_years=request.filter_years  # NEW!
         )
 
-        # Use the high-level service (it handles embedding and Qdrant calls)
+        # Execute search
         search_resp = await vector_service.search(query_params)
 
         # Build response
@@ -110,7 +126,6 @@ async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_r
         citations = []
 
         for i, r in enumerate(search_resp.results, 1):
-            # Map VectorSearchResult to your SearchResult model
             results.append(SearchResult(
                 chunk_id=r.chunk_id,
                 document_id=r.document_id,
@@ -120,7 +135,8 @@ async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_r
                 page_number=r.page_number,
                 section_title=r.section_title,
                 content_preview=r.content_preview,
-                chunk_index=r.chunk_index
+                chunk_index=r.chunk_index,
+                year=r.document_year  # NEW!
             ))
 
             citations.append(CitationInfo(
@@ -129,7 +145,13 @@ async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_r
                 page=r.page_number,
                 section=r.section_title,
                 snippet=r.content_preview,
+                year=r.document_year  # NEW!
             ))
+
+        logger.info(
+            f"Search completed: {len(results)} results "
+            f"(years={request.filter_years if request.filter_years else 'all'})"
+        )
 
         return SearchResponse(
             results=results,
@@ -150,6 +172,7 @@ async def search(request: SearchRequest, fastapi_req: Request):  # Add fastapi_r
 async def search_simple(
     query: str,
     top_k: int = 5,
+    fastapi_req: Request = None
 ):
     """
     Simple search endpoint.
@@ -157,7 +180,7 @@ async def search_simple(
     Returns just the results without formatting.
     """
     request = SearchRequest(query=query, top_k=top_k)
-    response = await search(request)
+    response = await search(request, fastapi_req)
 
     return {
         "query": query,
@@ -166,12 +189,12 @@ async def search_simple(
 
 
 @router.get("/stats")
-async def get_search_stats():
+async def get_search_stats(fastapi_req: Request):
     """Get vector database statistics."""
-    from app.main import qdrant_repo
+    vector_service = getattr(fastapi_req.app.state, "vector_service", None)
 
-    if not qdrant_repo:
-        return {"error": "Qdrant not configured"}
+    if not vector_service:
+        return {"error": "Search service not initialized"}
 
-    stats = await qdrant_repo.get_collection_stats()
+    stats = await vector_service.get_stats()
     return stats

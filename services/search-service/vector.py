@@ -1,7 +1,7 @@
 """
-Vector Search Service
+Vector Search Service - WITH YEAR FILTERING SUPPORT
 
-Provides high-level search interface for the RAG system.
+NEW: Passes year filters to Qdrant for temporal queries
 """
 
 import logging
@@ -10,20 +10,23 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
 from openai import AsyncOpenAI
-
-# UPDATED IMPORT: Use local qdrant module
 from qdrantc import QdrantRepository, VectorSearchResult
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class SearchQuery:
-    """Search query parameters."""
+    """
+    Search query parameters.
+
+    NEW: Added filter_years for temporal queries.
+    """
     query: str
     top_k: int = 5
     score_threshold: float = 0.3
     filter_document_ids: Optional[List[str]] = None
     filter_filenames: Optional[List[str]] = None
+    filter_years: Optional[List[int]] = None  # NEW!
     rerank: bool = False
 
 @dataclass
@@ -55,12 +58,13 @@ class SearchResponse:
 class VectorSearchService:
     """
     High-level vector search service for RAG.
+
+    NEW: Supports year filtering for temporal queries.
     """
 
     def __init__(self, qdrant_repo: QdrantRepository):
         self.qdrant_repo = qdrant_repo
 
-        # Load OpenAI config from .env
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
@@ -68,10 +72,18 @@ class VectorSearchService:
             logger.warning("OPENAI_API_KEY not set in environment variables.")
 
         self.client = AsyncOpenAI(api_key=self.api_key)
-        logger.info(f"VectorSearchService initialized using OpenAI model: {self.embedding_model}")
+        logger.info(f"VectorSearchService initialized with temporal support")
 
     async def search(self, query: SearchQuery) -> SearchResponse:
-        logger.info(f"Searching for: '{query.query[:50]}...' (top_k={query.top_k})")
+        """
+        Search with optional year filtering.
+
+        NEW: Supports filter_years parameter!
+        """
+        logger.info(
+            f"Searching: '{query.query[:50]}...' "
+            f"(top_k={query.top_k}, years={query.filter_years})"
+        )
 
         # Step 1: Generate query embedding
         try:
@@ -84,7 +96,7 @@ class VectorSearchService:
             logger.error(f"Failed to generate query embedding via OpenAI: {e}")
             raise
 
-        # Step 2: Search Qdrant
+        # Step 2: Search Qdrant with year filter
         try:
             results = await self.qdrant_repo.search(
                 query_embedding=query_embedding,
@@ -92,6 +104,7 @@ class VectorSearchService:
                 score_threshold=query.score_threshold,
                 filter_document_ids=query.filter_document_ids,
                 filter_filenames=query.filter_filenames,
+                filter_years=query.filter_years,  # NEW!
             )
         except Exception as e:
             logger.error(f"Qdrant search failed: {e}")
@@ -109,7 +122,8 @@ class VectorSearchService:
             query_metadata={
                 "top_k": query.top_k,
                 "score_threshold": query.score_threshold,
-                "embedding_model": self.embedding_model
+                "embedding_model": self.embedding_model,
+                "filter_years": query.filter_years  # NEW!
             }
         )
 
