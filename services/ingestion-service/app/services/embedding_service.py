@@ -8,8 +8,8 @@ Handles batching, error recovery, and provider health checks.
 import logging
 from typing import List
 
-from app.models import Chunk
-from app.providers.embedding import EmbeddingProvider
+from app.libr.chunking import Chunk
+from app.libr.providers.embedding import EmbeddingProvider
 
 logger = logging.getLogger(__name__)
 
