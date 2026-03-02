@@ -30,7 +30,6 @@ __all__ = [
     # Request/Response
     "ChatRequest",
     "ChatResponse",
-    "StreamChunk",
 
     # Health
     "HealthStatus",
@@ -273,25 +272,6 @@ class ChatResponse(BaseModel):
         None,
         description="Message when no relevant context found"
     )
-
-
-class StreamChunk(BaseModel):
-    """
-    Streaming response chunk.
-
-    For real-time UI updates during generation.
-    """
-
-    type: Literal["token", "citation", "done", "error"] = Field(
-        ...,
-        description="Chunk type"
-    )
-    content: Optional[str] = Field(None, description="Token content")
-    citation: Optional[CitationDisplay] = Field(None, description="Citation if type=citation")
-
-    # Final data (when type=done)
-    final_response: Optional[ChatResponse] = Field(None)
-    error_message: Optional[str] = Field(None)
 
 
 # =============================================================================

@@ -7,8 +7,7 @@ from datetime import datetime
 import logging
 import json
 
-from app.sql import JobModel, DocumentModel, ChunkModel
-from app.models import JobStatus
+from app.ingestion.models import JobModel, DocumentModel, ChunkModel, JobStatus
 
 logger = logging.getLogger(__name__)
 

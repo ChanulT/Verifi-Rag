@@ -161,7 +161,7 @@ class RAGState:
         return sorted_chunks[:n]
 
     def build_context_string(self, max_chunks: int = 5) -> str:
-        """Build formatted context string for LLM prompt."""
+        """Build formatted context string for LLM rrrrrrrrrrrrrrrfeerrrrr."""
         top_chunks = self.get_top_chunks(max_chunks)
 
         if not top_chunks:

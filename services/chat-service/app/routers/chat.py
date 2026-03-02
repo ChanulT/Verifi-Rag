@@ -11,7 +11,7 @@ from app.models import (
 )
 from app.config import settings_manager
 # We import AppState only for type checking if needed, but we use request.app.state dynamically
-from app.state import AppState
+
 
 logger = logging.getLogger(__name__)
 
